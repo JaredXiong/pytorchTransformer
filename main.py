@@ -14,6 +14,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -39,7 +40,8 @@ class TransformerModel(nn.Module):
         self.pos_encoder = PositionalEncoding(d_model)
 
         # 标准Transformer编码器结构
-        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dropout=dropout, batch_first=True, dim_feedforward=512)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dropout=dropout, batch_first=True,
+                                                    dim_feedforward=512)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
 
         self.decoder = nn.Linear(d_model, input_size)
@@ -198,18 +200,19 @@ def train_model(model, train_loader, test_loader, num_epochs, learning_rate):
             torch.save(model.state_dict(), 'best_model.pth')
         else:
             early_stop_counter += 1
-            if early_stop_counter >= 15:
+            if early_stop_counter >= 10:
                 logger.info("提前停止训练")
                 break
-        
+
         if epoch % 10 == 0:
-            logger.info(f"Epoch [{epoch}/{num_epochs}], Train Loss: {total_loss/len(train_loader):.4f}, Test Loss: {test_loss:.4f}")
+            logger.info(
+                f"Epoch [{epoch}/{num_epochs}], Train Loss: {total_loss / len(train_loader):.4f}, Test Loss: {test_loss:.4f}")
 
 
 def validate_prediction(prediction: np.ndarray) -> np.ndarray:
     """验证预测结果的物理合理性"""
-    min_values = np.array([0, 0, 0, 0, 0, 0.3, 0])  # 各特征最小值
-    max_ratios = np.array([1.0, 0.8, 0.7, 0.5, 0.1, 0.05, 1.0])  # 各污染物/AQI最大比例
+    min_values = np.array([0, 0, 0, 0, 0, 0, 0])  # 各特征最小值
+    max_ratios = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])  # 禁用比例约束，避免压低预测值
 
     validated = np.clip(prediction, min_values, None)
 
@@ -250,8 +253,8 @@ def predict_air_quality(model_weights_path, scaler_path, input_sequence):
     model.load_state_dict(torch.load(model_weights_path, map_location=device))
     model.eval()
 
-    input_scaled = scaler.transform(input_sequence)
-    input_tensor = torch.FloatTensor(input_scaled).unsqueeze(0).to(device)
+    # 移除重复标准化，直接使用已标准化的输入序列
+    input_tensor = torch.FloatTensor(input_sequence).unsqueeze(0).to(device)
 
     with torch.no_grad():
         output = model(input_tensor)
@@ -263,9 +266,9 @@ def predict_air_quality(model_weights_path, scaler_path, input_sequence):
     prediction = prediction.reshape(-1, 3, 7)  # 重新调整为 (batch, days, features)
     prediction = validate_prediction(prediction)
 
-    # 添加季节调整因子（示例）
-    season_factor = np.array([1.0, 1.0, 1.0, 0.9, 0.8, 0.7, 1.1])  # 冬季调整
-    prediction = prediction * season_factor
+    # 移除可能导致预测值偏低的季节调整因子
+    # season_factor = np.array([1.0, 1.0, 1.0, 0.9, 0.8, 0.7, 1.1])  # 冬季调整
+    # prediction = prediction * season_factor
 
     return np.clip(prediction, a_min=0, a_max=500)
 
@@ -287,17 +290,16 @@ def main():
     # 修改main函数中的数据处理流程
     X, y = create_sequences(data, SEQ_LENGTH)
     split = int(0.8 * len(X))
-    
+
     # 正确划分训练集和测试集
     X_train = X[:split]
     X_test = X[split:]
     y_train = y[:split]
     y_test = y[split:]
 
-    # 仅使用训练集拟合标准化器
-    scaler = StandardScaler().fit(X_train.reshape(-1, X_train.shape[-1]))
-    X_train_scaled = scaler.transform(X_train.reshape(-1, X_train.shape[-1])).reshape(X_train.shape)
-    X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
+    # 使用原始scaler，不再创建新的Scaler实例
+    X_train_scaled = X_train  # 已在load_and_preprocess_data中标准化
+    X_test_scaled = X_test  # 已在load_and_preprocess_data中标准化
 
     # 数据加载器
     train_loader = torch.utils.data.DataLoader(
@@ -332,7 +334,7 @@ def main():
 
         # 计算预测日期（最后日期+1天）
         last_date = pd.to_datetime(dates.iloc[-1])
-        prediction_dates = [(last_date + timedelta(days=i+1)).strftime('%Y/%m/%d') for i in range(3)]
+        prediction_dates = [(last_date + timedelta(days=i + 1)).strftime('%Y/%m/%d') for i in range(3)]
 
         # 执行预测
         predictions = predict_air_quality('best_model.pth', 'scaler.pkl', sample_input)
