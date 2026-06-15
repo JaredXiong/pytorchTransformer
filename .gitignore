@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.env
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project artifacts (training output)
+outputs/checkpoints/*.pth
+outputs/checkpoints/*.pkl
+outputs/figures/*.png
+
+# Raw data (kept locally; large files often go in DVC / external storage)
+# Uncomment the next line if the dataset should not be committed:
+# data/raw/
+
+# Logs
+*.log
