@@ -1,0 +1,620 @@
+% !TEX program = xelatex
+% =============================================================================
+%  pytorchTransformer  ——  算法数学原理
+%  项目：基于 14 天输入（9 维特征）的空气质量多污染物 3 日预测系统
+%  内容：数据预处理、位置编码、Transformer / LSTM / CNN / Hybrid / Ensemble 五种模型、
+%        训练优化（Adam + OneCycleLR + 梯度裁剪 + 早停）、
+%        损失函数（MSE / Huber / Anti-Smoothing 复合损失）、
+%        评估指标（RMSE / MAE / R² / 反平滑检测）、
+%        自回归推理与软饱和。
+%
+%  ★★★ 编译前必读（尤其在 Overleaf 上） ★★★
+%  -----------------------------------------------------------------
+%  1) 引擎必须选择 XeLaTeX（不是 pdfLaTeX）！
+%     Overleaf 设置：左上角 Menu → Compiler → "XeLaTeX"
+%     命令行：       xelatex math_principles.tex
+%                    xelatex math_principles.tex   # 第二次生成目录
+%
+%  2) 字体集使用 fandol（TeX Live 自带，无需额外安装）。
+%     若你使用本地 TeX Live 2025+ 但 fandol 缺失，运行
+%     `tlmgr install fandol` 安装；Overleaf 已自带。
+%
+%  3) 如果你仍坚持使用 pdfLaTeX：
+%     - 必须把 \usepackage[UTF8,fontset=fandol]{ctex} 注释掉；
+%     - 改用 \usepackage{CJKutf8}；
+%     - 正文外用 \begin{CJK}{UTF8}{gbsn} ... \end{CJK} 包裹中文。
+%     但这会损失 ctex 自带的标题/目录中文格式化效果，不推荐。
+%
+%  4) 历史上报错的可能原因：
+%     - "CTeX fontset 'fandol' unavailable"   → 用了 pdfLaTeX；切到 XeLaTeX
+%     - "fontspec requires XeTeX/LuaTeX"       → 同上
+%     - "font unihei9e not found"              → pdfLaTeX 找不到中文字体
+%     - "\Attention undefined" 等              → 已修复（见下方 \DeclareMathOperator）
+% =============================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+% ---------- 字体与中文支持 ----------
+% ctex 宏包在 XeLaTeX 下会自动加载 fontspec，不需要单独再写 \usepackage{fontspec}
+% 若使用 pdfLaTeX，请注释掉下面这一行并改用 CJKutf8 之类的替代方案（不推荐）
+\usepackage[UTF8,fontset=fandol]{ctex}  % 中文支持；fandol 字体随 TeX Live 自带，仅需 XeLaTeX
+\usepackage{amsmath,amssymb,amsfonts}  % 数学公式
+\usepackage{bm}                       % 加粗数学符号
+\usepackage{mathrsfs}                 % 数学花体
+\usepackage{geometry}                 % 页面布局
+\geometry{a4paper,margin=2.4cm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,calc}
+
+% ---------- 自定义命令 ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\sigmoid}{sigmoid}
+\DeclareMathOperator{\LayerNorm}{LayerNorm}
+\DeclareMathOperator{\FFN}{FFN}
+\DeclareMathOperator{\MHA}{MHA}
+\DeclareMathOperator{\BN}{BN}
+\DeclareMathOperator{\ReLU}{ReLU}
+\DeclareMathOperator{\GeLU}{GeLU}
+% ---- 新增：原文中已使用但未声明的算子 ----
+\DeclareMathOperator{\Attention}{Attention}
+\DeclareMathOperator{\MaxPool}{MaxPool}
+\DeclareMathOperator{\Conv1d}{Conv1d}
+\newcommand{\mat}[1]{\bm{#1}}
+\newcommand{\vect}[1]{\bm{#1}}
+
+\title{\bfseries 空气质量多步预测系统——算法数学原理}
+\author{pytorchTransformer 项目文档}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+% =============================================================================
+\section{问题形式化}
+% =============================================================================
+设历史观测序列长度为 $T_{\text{in}} = 14$，每次观测的特征维度为
+\[
+d_{\text{in}} = 9 \;\;(\text{7 个污染物} + \text{month} + \text{season}) .
+\]
+模型输出未来 $T_{\text{out}} = 3$ 天的 \emph{污染物浓度} 序列，输出维度为
+\[
+d_{\text{out}} = 7 \;\;(\text{仅污染物，不含 month/season}) .
+\]
+
+形式化地，给定输入
+\[
+\mat{X} = \bigl[\vect{x}_1, \vect{x}_2, \dots, \vect{x}_{T_{\text{in}}}\bigr]^{\top} \in \R^{T_{\text{in}} \times d_{\text{in}}},
+\]
+模型 $f_{\theta}$ 产生
+\[
+\widehat{\mat{Y}} = f_{\theta}(\mat{X}) \in \R^{T_{\text{in}} \times d_{\text{out}}},
+\]
+取尾部 $T_{\text{out}}$ 时间步
+\[
+\widehat{\mat{Y}}_{\text{pred}} = \widehat{\mat{Y}}\bigl[-T_{\text{out}}:,\; :\bigr] \in \R^{T_{\text{out}} \times d_{\text{out}}},
+\]
+与真实目标 $\mat{Y} \in \R^{T_{\text{out}} \times d_{\text{out}}}$ 对齐。
+
+% =============================================================================
+\section{数据预处理}
+% =============================================================================
+
+\subsection{异常值裁剪（IQR 规则）}
+对第 $j$ 个污染物列 $\vect{z}_j \in \R^N$，计算四分位
+\[
+Q_1 = \mathrm{P}_{25}(\vect{z}_j), \quad Q_3 = \mathrm{P}_{75}(\vect{z}_j), \quad \mathrm{IQR} = Q_3 - Q_1 .
+\]
+下界与上界为
+\[
+z_j^{\min} = \max(0, Q_1 - 1.5\,\mathrm{IQR}),\qquad
+z_j^{\max} =
+\begin{cases}
+500, & j = \text{AQI}, \\
+50,  & j = \text{CO}, \\
+Q_3 + 3.0\,\mathrm{IQR}, & \text{其他}.
+\end{cases}
+\]
+裁剪后
+\[
+\widetilde{z}_{j,i} = \min\bigl\{\max(z_{j,i},\,z_j^{\min}),\,z_j^{\max}\bigr\},\quad i = 1,\dots,N.
+\]
+
+\subsection{缺失值填补与标准化}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{中位数填补}：仅用于 scaler fit 阶段，使用 $\widetilde{\mat{Z}}$ 的中位数；
+  \item \textbf{均值填补}：用于训练目标，使用裁剪后数据的列均值；
+  \item \textbf{标准化（仅作用于 7 个污染物）}：
+  \[
+  \hat{z}_{j,i} = \frac{z_{j,i} - \mu_j}{\sigma_j},\quad
+  \mu_j = \frac{1}{N}\sum_{i=1}^N z_{j,i},\;
+  \sigma_j = \sqrt{\frac{1}{N}\sum_{i=1}^N (z_{j,i} - \mu_j)^2}.
+  \]
+  scaler fit 阶段使用 \emph{未裁剪} 的原始数据（$scaler\_on\_uncapped = \text{True}$），
+  以保留真实动态范围；clip 仅作用于训练目标。
+  \item \textbf{日历特征保留原值}：$\text{month} \in \{1,\dots,12\}$，$\text{season} \in \{1,2,3,4\}$ 不缩放。
+\end{itemize}
+
+\subsection{序列构造（滑窗）}
+以步长 $1$ 在时间轴上滑动，得到 $N_{\text{sample}} = N - T_{\text{in}} - T_{\text{out}} + 1$ 个样本：
+\[
+\mat{X}^{(k)} = \mat{Z}[k : k + T_{\text{in}}] \in \R^{T_{\text{in}} \times 9},\qquad
+\mat{Y}^{(k)} = \mat{Z}[k + T_{\text{in}} : k + T_{\text{in}} + T_{\text{out}},\, :7] \in \R^{T_{\text{out}} \times 7}.
+\]
+
+\subsection{数据集划分}
+按时间顺序切分（避免未来信息泄露）：
+\[
+N_{\text{train}} = \lfloor \rho\, N_{\text{sample}}\rfloor,\quad \rho = 0.8.
+\]
+
+% =============================================================================
+\section{位置编码（Positional Encoding）}
+% =============================================================================
+Transformer 不具备位置信息，因此为输入嵌入 $\mat{E} \in \R^{T_{\text{in}} \times d}$ 注入
+位置编码 $\mat{P} \in \R^{T_{\text{in}} \times d}$：
+\[
+\mat{PE}(t, 2i)   = \sin\!\Bigl(\frac{t}{10000^{2i/d}}\Bigr),\qquad
+\mat{PE}(t, 2i+1) = \cos\!\Bigl(\frac{t}{10000^{2i/d}}\Bigr),
+\]
+\[
+\mat{X}_{\text{pos}} = \mat{E} + \mat{P}\in \R^{T_{\text{in}} \times d}.
+\]
+等价实现为
+\[
+\mat{P} = \bigl[\,\vect{p}_1, \dots, \vect{p}_{T_{\text{in}}}\,\bigr]^{\top},\quad
+\vect{p}_t^{(2i)} = \sin(\omega_i t),\;\;
+\vect{p}_t^{(2i+1)} = \cos(\omega_i t),\;\;
+\omega_i = \exp\!\Bigl(-\frac{2i}{d}\ln 10000\Bigr).
+\]
+实际前向常对嵌入再做缩放 $\sqrt{d}$ 以稳定点积尺度：
+\[
+\mat{X}_{\text{in}} = \sqrt{d}\,(\mat{E} + \mat{P}).
+\]
+
+% =============================================================================
+\section{Transformer 模型}
+% =============================================================================
+
+\subsection{缩放点积注意力}
+对查询 $\mat{Q}\in\R^{n \times d_k}$、键 $\mat{K}\in\R^{m \times d_k}$、值 $\mat{V}\in\R^{m \times d_v}$：
+\[
+\Attention(\mat{Q},\mat{K},\mat{V})
+=
+\softmax\!\Bigl(\frac{\mat{Q}\mat{K}^{\top}}{\sqrt{d_k}}\Bigr)\mat{V}.
+\]
+
+\subsection{多头注意力}
+将 $\mat{Q},\mat{K},\mat{V}$ 沿特征维切分为 $h$ 个头（$d_k = d/h$），
+分别计算后拼接投影：
+\[
+\MHA(\mat{Q},\mat{K},\mat{V}) = \bigl[\,\mathrm{head}_1 \Vert \cdots \Vert \mathrm{head}_h\,\bigr]\mat{W}^{O},
+\]
+\[
+\mathrm{head}_i = \Attention(\mat{Q}\mat{W}_i^{Q},\,\mat{K}\mat{W}_i^{K},\,\mat{V}\mat{W}_i^{V}).
+\]
+本项目取 $h=4$。
+
+\subsection{Pre-LN 编码器层}
+本项目采用 \emph{pre-LN}（$\mathrm{norm\_first = True}$），单层前向为
+\begin{align}
+\mat{X}' &= \mat{X} + \MHA\!\bigl(\LayerNorm(\mat{X})\bigr),\\
+\mat{X}'' &= \mat{X}' + \FFN\!\bigl(\LayerNorm(\mat{X}')\bigr),\\
+\FFN(\mat{u}) &= \mat{W}_2\,\GeLU(\mat{W}_1 \mat{u} + \vect{b}_1) + \vect{b}_2,
+\end{align}
+其中 $\FFN$ 维度为 $d \to d_{\text{ff}} \to d$（$d_{\text{ff}} = 4d$）。
+
+将 $L = 4$ 层堆叠即得 $\mat{H} \in \R^{T_{\text{in}} \times d}$。
+
+\subsection{残差捷径与逐特征门控}
+为缓解均值回归，将输入投影同时作为 identity 残差引入：
+\begin{align}
+\mathrm{identity} &= \mat{W}_{\text{in}}\mat{X} \in \R^{T_{\text{in}} \times d},\\
+\mat{Z}_{\text{decoder}} &= \mat{W}_{\text{out}}\mat{H} \in \R^{T_{\text{in}} \times 7},\\
+\widehat{\mat{Y}} &= \bigl(\mat{Z}_{\text{decoder}} \odot \vect{s}\bigr) + \sigma(\alpha)\cdot \mat{W}_{r}\,\mathrm{identity},
+\end{align}
+其中 $\vect{s} \in \R^7$ 为可学习 \emph{逐特征门控}，$\alpha$ 为可学习残差 logit
+（$\sigma(\alpha) \in (0,1)$），$\mat{W}_r$ 为 identity 维数对齐的线性层。
+该结构允许网络学习"几乎不用残差"或"几乎完全用残差"，默认 $\alpha = 0.3$，
+$\sigma(0.3) \approx 0.574$。
+
+% =============================================================================
+\section{LSTM 模型}
+% =============================================================================
+
+\subsection{单时间步门控}
+输入 $\vect{x}_t \in \R^{d_{\text{in}}}$、上一时刻隐状态 $\vect{h}_{t-1}\in\R^{H}$，门与候选为
+\begin{align}
+\vect{i}_t &= \sigma(\mat{W}_i [\vect{h}_{t-1};\vect{x}_t] + \vect{b}_i), &&\text{（input gate）}\\
+\vect{f}_t &= \sigma(\mat{W}_f [\vect{h}_{t-1};\vect{x}_t] + \vect{b}_f), &&\text{（forget gate）}\\
+\vect{o}_t &= \sigma(\mat{W}_o [\vect{h}_{t-1};\vect{x}_t] + \vect{b}_o), &&\text{（output gate）}\\
+\widetilde{\vect{c}}_t &= \tanh(\mat{W}_c [\vect{h}_{t-1};\vect{x}_t] + \vect{b}_c), &&\text{（cell candidate）}\\
+\vect{c}_t &= \vect{f}_t \odot \vect{c}_{t-1} + \vect{i}_t \odot \widetilde{\vect{c}}_t,\\
+\vect{h}_t &= \vect{o}_t \odot \tanh(\vect{c}_t).
+\end{align}
+其中 $[\cdot;\cdot]$ 表示拼接，$\sigma$ 为 logistic sigmoid。
+
+\subsection{双向多层 LSTM}
+本项目取 $L = 4$ 层、$H = 256$、$\mathrm{bidirectional} = \mathrm{True}$。
+最终隐状态维度为 $2H$，输出
+\[
+\mat{H} = \bigl[\,\overrightarrow{\mat{H}}\,\Vert\,\overleftarrow{\mat{H}}\,\bigr] \in \R^{T_{\text{in}} \times 2H}.
+\]
+
+\subsection{输出投影}
+\[
+\widehat{\mat{Y}} = \mat{W}_2\,\ReLU\!\bigl(\mat{W}_1\,\mat{H} + \vect{b}_1\bigr) + \vect{b}_2 \in \R^{T_{\text{in}} \times 7}.
+\]
+
+% =============================================================================
+\section{CNN 模型（多尺度时序卷积）}
+% =============================================================================
+
+\subsection{卷积块}
+对 $\mat{X}\in \R^{T_{\text{in}}\times d_{\text{in}}}$，先转置为 $\R^{d_{\text{in}} \times T_{\text{in}}}$。
+对每个核大小 $k \in \{3, 5, 7\}$ 构造卷积块：
+\[
+\mat{Z}_k = \MaxPool_1\!\Bigl(\ReLU\bigl(\BN(\Conv1d_{k}(\mat{X}))\bigr)\Bigr),\quad
+\Conv1d_{k}: \R^{d_{\text{in}}\times T_{\text{in}}} \to \R^{F \times T_{\text{in}}},\; F=64.
+\]
+沿通道拼接：
+\[
+\mat{Z} = [\mat{Z}_3 \Vert \mat{Z}_5 \Vert \mat{Z}_7] \in \R^{3F \times T_{\text{in}}}.
+\]
+
+\subsection{自适应池化与投影}
+\[
+\mat{Z}' = \mathrm{AdaptiveAvgPool}_{T_{\text{in}}}(\mat{Z}) \in \R^{3F \times T_{\text{in}}},\quad
+\mat{H} = \mathrm{permute}(\mat{Z}') \in \R^{T_{\text{in}} \times 3F},
+\]
+\[
+\widehat{\mat{Y}} = \mat{W}_2\,\ReLU(\mat{W}_1\mat{H} + \vect{b}_1) + \vect{b}_2 \in \R^{T_{\text{in}}\times 7}.
+\]
+
+% =============================================================================
+\section{混合模型（Hybrid）}
+% =============================================================================
+混合模型在共享投影之上并行三条分支，再以六路交叉注意力融合。
+
+\subsection{共享输入投影}
+\[
+\mat{E} = \mat{W}_{\text{in}}\mat{X} \in \R^{T_{\text{in}} \times d},\quad d = 128.
+\]
+
+\subsection{三分支编码器}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Transformer 分支}：位置编码 + $2$ 层 pre-LN TransformerEncoder；
+  \item \textbf{LSTM 分支}：$2$ 层双向 LSTM（hidden = $d$）；
+  \item \textbf{CNN 分支}：多尺度 $\mathrm{Conv1d}$ + BN + ReLU + AdaptiveAvgPool。
+\end{itemize}
+三条分支共享输入 $\mat{E}$，输出维度统一为 $d$：
+\[
+\mat{H}_T, \mat{H}_L, \mat{H}_C \in \R^{T_{\text{in}} \times d}.
+\]
+
+\subsection{轻量自注意力}
+每个分支末尾再串接一次自注意力 + 残差 + LayerNorm：
+\[
+\widetilde{\mat{H}} = \LayerNorm\bigl(\mat{H} + \MHA(\mat{H},\mat{H},\mat{H})\bigr).
+\]
+
+\subsection{六路交叉注意力融合}
+对三个投影 $\mat{T},\mat{L},\mat{C} = \mat{W}_T\widetilde{\mat{H}}_T,\; \mat{W}_L\widetilde{\mat{H}}_L,\; \mat{W}_C\widetilde{\mat{H}}_C$，
+构造 6 个交叉注意力（$T\!\leftarrow\!L$、$T\!\leftarrow\!C$、$L\!\leftarrow\!T$、$L\!\leftarrow\!C$、$C\!\leftarrow\!T$、$C\!\leftarrow\!L$）：
+\begin{align}
+\mat{T}_{L} &= \MHA(\mat{T},\mat{L},\mat{L}),\quad
+\mat{T}_{C} = \MHA(\mat{T},\mat{C},\mat{C}),\quad
+\mat{T}_{\text{fused}} = \LayerNorm(\mat{T} + \mat{T}_L + \mat{T}_C),\\
+\mat{L}_{T} &= \MHA(\mat{L},\mat{T},\mat{T}),\quad
+\mat{L}_{C} = \MHA(\mat{L},\mat{C},\mat{C}),\quad
+\mat{L}_{\text{fused}} = \LayerNorm(\mat{L} + \mat{L}_T + \mat{L}_C),\\
+\mat{C}_{T} &= \MHA(\mat{C},\mat{T},\mat{T}),\quad
+\mat{C}_{L} = \MHA(\mat{C},\mat{L},\mat{L}),\quad
+\mat{C}_{\text{fused}} = \LayerNorm(\mat{C} + \mat{C}_T + \mat{C}_L).
+\end{align}
+
+\subsection{可学习加权融合}
+对可学习参数 $\vect{\beta} \in \R^3$，有
+\[
+\vect{w} = \softmax(\vect{\beta}) \in \Delta^{2},\qquad
+\mat{F} = w_1\mat{T}_{\text{fused}} + w_2\mat{L}_{\text{fused}} + w_3\mat{C}_{\text{fused}}.
+\]
+最终经 MLP + 残差：
+\[
+\widehat{\mat{Y}} = \mat{W}_{o2}\,\ReLU\bigl(\mat{W}_{o1}\mat{F} + \vect{b}_{o1}\bigr) + \vect{b}_{o2}
+\;+\; \sigma(\alpha)\,\mat{E}.
+\]
+
+% =============================================================================
+\section{集成模型（Ensemble）}
+% =============================================================================
+设 $M$ 个子模型 $\{f_m\}_{m=1}^{M}$，对应权重 $\vect{w} = (w_1,\dots,w_M)$（默认均匀）：
+\[
+\vect{w} = \bigl(\tfrac{1}{M},\dots,\tfrac{1}{M}\bigr),\quad
+\widehat{\mat{Y}}_{\text{ens}} = \sum_{m=1}^{M} w_m\, f_m(\mat{X}) \in \R^{T_{\text{in}}\times 7}.
+\]
+约束 $\sum_m w_m = 1,\, w_m \ge 0$。
+
+% =============================================================================
+\section{训练数学}
+% =============================================================================
+
+\subsection{优化器（Adam）}
+对参数 $\theta$ 与目标函数 $\mathcal{L}(\theta)$，Adam 维护一阶与二阶矩估计：
+\begin{align}
+\vect{g}_t &= \nabla_{\theta} \mathcal{L}(\theta_t),\\
+\vect{m}_t &= \beta_1 \vect{m}_{t-1} + (1 - \beta_1)\vect{g}_t,\\
+\vect{v}_t &= \beta_2 \vect{v}_{t-1} + (1 - \beta_2)\vect{g}_t^2,\\
+\widehat{\vect{m}}_t &= \frac{\vect{m}_t}{1 - \beta_1^{t}},\quad
+\widehat{\vect{v}}_t = \frac{\vect{v}_t}{1 - \beta_2^{t}},\\
+\theta_{t+1} &= \theta_t - \eta_t \frac{\widehat{\vect{m}}_t}{\sqrt{\widehat{\vect{v}}_t} + \epsilon}.
+\end{align}
+权重衰减以解耦方式施加（$\theta_{t+1} \leftarrow \theta_{t+1} - \eta_t \lambda \theta_t$），
+本项目默认 $\beta_1 = 0.9, \beta_2 = 0.999, \lambda = 3\times 10^{-4}, \epsilon = 10^{-8}$。
+
+\subsection{梯度裁剪}
+按全局 L2 范数裁剪：
+\[
+\vect{g} \leftarrow \begin{cases}
+\vect{g}, & \|\vect{g}\| \le c,\\
+\dfrac{c}{\|\vect{g}\|}\,\vect{g}, & \|\vect{g}\| > c,
+\end{cases}
+\qquad c = 1.0.
+\]
+
+\subsection{OneCycleLR 学习率调度}
+设总批次数 $T_{\text{tot}} = N_{\text{epoch}} \cdot N_{\text{batch}}$，峰值 $p = 0.1\,T_{\text{tot}}$，
+最高学习率 $\eta_{\max} = 10\,\eta_0 = 3\times 10^{-3}$。调度分三段：
+\[
+\eta(t) =
+\begin{cases}
+\dfrac{t}{p}\,\eta_{\max}, & t < p \;\;(\text{warmup, 线性}),\\
+\dfrac{1}{2}\eta_{\max}\bigl(1 + \cos\pi \tfrac{t - p}{T_{\text{tot}} - p}\bigr), & t \ge p \;\;(\text{cosine anneal}).
+\end{cases}
+\]
+
+\subsection{早停}
+记 $v_e$ 为第 $e$ epoch 验证损失，$e^{*} = \arg\min_e v_e$。
+若连续 $P$ 个 epoch 验证损失不下降则停止：
+\[
+\min\bigl\{e - e^{*} : e - e^{*} \ge P\bigr\},\quad P = 40.
+\]
+另设 \emph{反平滑早停}：若连续 $P_s = 15$ 个 epoch 多数污染物被判为"过度平滑"则停止。
+
+\subsection{训练算法}
+\begin{algorithm}[ht]
+\caption{单 epoch 训练 / 验证（mini-batch SGD with Adam + OneCycleLR）}
+\begin{algorithmic}[1]
+\FOR{each epoch $e = 0,\dots,E-1$}
+  \STATE 同步 warmup 进度到 AntiSmoothingLoss（若使用）
+  \STATE $\text{model.train}()$
+  \FOR{each batch $(\mat{X}^{(b)}, \mat{Y}^{(b)})$}
+    \STATE $\widehat{\mat{Y}}^{(b)} \gets f_{\theta}(\mat{X}^{(b)})$  \emph{// 整段序列}
+    \STATE $\widetilde{\mat{Y}}^{(b)} \gets \widehat{\mat{Y}}^{(b)}[-T_{\text{out}}:, :]$  \emph{// 取尾部}
+    \STATE $\theta.\text{grad} \gets 0$
+    \STATE $\mathcal{L} \gets \mathrm{loss}(\widetilde{\mat{Y}}^{(b)}, \mat{Y}^{(b)})$
+    \STATE $\mathcal{L}.\text{backward()}$
+    \STATE clip-by-norm: $\|\vect{g}\| \le c$
+    \STATE Adam 更新 $\theta$
+    \STATE OneCycleLR 更新学习率
+  \ENDFOR
+  \STATE $\text{model.eval}()$，按同样方式计算 $\mathcal{L}_{\text{val}}$
+  \IF{$\mathcal{L}_{\text{val}} < \mathcal{L}_{\text{best}}$}
+    \STATE 保存最优权重，记录 $e^{*}$
+  \ELSE
+    \STATE 触发早停计数
+  \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+% =============================================================================
+\section{损失函数}
+% =============================================================================
+
+\subsection{基础回归损失}
+记样本数为 $B$，时间步 $T = T_{\text{out}}$，特征数 $F = d_{\text{out}} = 7$。
+\begin{itemize}[leftmargin=*]
+  \item \textbf{MSE}：
+  \[
+  \mathcal{L}_{\text{MSE}} = \frac{1}{BTF}\sum_{b,t,f}(\widehat{y}_{b,t,f} - y_{b,t,f})^2.
+  \]
+  \item \textbf{MAE（L1）}：
+  \[
+  \mathcal{L}_{\text{MAE}} = \frac{1}{BTF}\sum_{b,t,f}|\widehat{y}_{b,t,f} - y_{b,t,f}|.
+  \]
+  \item \textbf{Huber}（$|\delta| \le 1$ 二次，$|\delta| > 1$ 线性，$\delta = \widehat y - y$）：
+  \[
+  \mathcal{L}_{\delta}(y,\widehat{y}) = \frac{1}{BTF}\sum_{b,t,f}
+  \begin{cases}
+  \tfrac{1}{2}\delta^2, & |\delta| \le \delta_0,\\
+  \delta_0\bigl(|\delta| - \tfrac{1}{2}\delta_0\bigr), & |\delta| > \delta_0,
+  \end{cases}
+  \quad \delta_0 = 1.0.
+  \]
+  \item \textbf{Smooth L1}：与 Huber 同形，$\beta$ 代替 $\delta_0$。
+\end{itemize}
+
+\subsection{反平滑复合损失（AntiSmoothingLoss）}
+本项目默认使用 $loss\_type = \text{mse\_antismooth}$。整体损失：
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{MSE}} + \gamma \bigl(\lambda_{\text{var}}\mathcal{L}_{\text{var}} + \lambda_{\text{diff}}\mathcal{L}_{\text{diff}}\bigr),
+\end{equation}
+其中 warmup 因子
+\[
+\gamma = \min\!\Bigl(\frac{e}{E_{\text{warm}}},\, 1\Bigr),\quad E_{\text{warm}} = 20.
+\]
+
+\paragraph{方差下界惩罚。}
+对每个特征 $f$ 与每个样本 $b$ 计算时间维度上的标准差比
+\[
+r^{\text{var}}_{b,f} = \frac{\mathrm{std}_{t}\bigl(\widehat{\mat{Y}}_{b,:,f}\bigr)}
+{\mathrm{std}_{t}\bigl(\mat{Y}_{b,:,f}\bigr) + \epsilon},
+\]
+\[
+\mathcal{L}_{\text{var}} = \frac{1}{BF}\sum_{b,f}\max\!\bigl(\tau_{\text{var}} - r^{\text{var}}_{b,f},\, 0\bigr),
+\quad \tau_{\text{var}} = 0.5.
+\]
+当 $\mathrm{std}(\widehat y) < \tau_{\text{var}}\cdot \mathrm{std}(y)$ 时开始惩罚，避免预测塌缩到均值。
+
+\paragraph{一阶差分下界惩罚。}
+对 $\Delta\widehat{\mat{Y}}_{b,t,f} = \widehat{\mat{Y}}_{b,t+1,f} - \widehat{\mat{Y}}_{b,t,f}$ 与 $\Delta\mat{Y}$：
+\[
+r^{\text{diff}}_{b,f} = \frac{\mathrm{std}_t(\Delta\widehat{\mat{Y}}_{b,:,f})}
+{\mathrm{std}_t(\Delta\mat{Y}_{b,:,f}) + \epsilon},
+\]
+\[
+\mathcal{L}_{\text{diff}} = \frac{1}{BF}\sum_{b,f}\max\!\bigl(\tau_{\text{diff}} - r^{\text{diff}}_{b,f},\, 0\bigr),
+\quad \tau_{\text{diff}} = 0.5.
+\]
+当预测的相邻日变化幅度过小时触发惩罚，缓解"日内波动被压平"。
+
+% =============================================================================
+\section{评估指标与反平滑检测}
+% =============================================================================
+
+\subsection{逐特征与整体指标}
+设 $\mat{Y}, \widehat{\mat{Y}} \in \R^{N\times F}$：
+\begin{align}
+\mathrm{MSE}    &= \frac{1}{NF}\sum_{i,f}(y_{i,f} - \widehat{y}_{i,f})^2, &
+\mathrm{RMSE} &= \sqrt{\mathrm{MSE}},\\
+\mathrm{MAE}    &= \frac{1}{NF}\sum_{i,f}|y_{i,f} - \widehat{y}_{i,f}|, &
+R^2           &= 1 - \frac{\sum_{i,f}(y_{i,f} - \widehat{y}_{i,f})^2}
+                           {\sum_{i,f}(y_{i,f} - \bar y)^2}.
+\end{align}
+
+\subsection{过度平滑检测}
+对每个特征 $f$：
+\[
+\varrho_f^{\text{std}} = \frac{\mathrm{std}(\widehat{\mat{Y}}_{\cdot,f})}{\mathrm{std}(\mat{Y}_{\cdot,f}) + \epsilon},\qquad
+\varrho_f^{\text{diff}} = \frac{\mathrm{std}\bigl(\Delta\widehat{\mat{Y}}_{\cdot,f}\bigr)}{\mathrm{std}\bigl(\Delta\mat{Y}_{\cdot,f}\bigr) + \epsilon}.
+\]
+若
+\[
+\varrho_f^{\text{std}} < \tau \;\; \text{or} \;\; \varrho_f^{\text{diff}} < \tau,\quad \tau = 0.1,
+\]
+则将特征 $f$ 标记为"过度平滑"。
+
+% =============================================================================
+\section{推理数学（自回归预测 + 软饱和）}
+% =============================================================================
+
+\subsection{标准化一致性}
+训练时 scaler 拟合于"未裁剪"原始分布，推理时使用同一 scaler 做
+\[
+\widehat{y}_{\text{scaled}} = \frac{\widehat{y}_{\text{raw}} - \mu_j}{\sigma_j},\qquad
+\widehat{y}_{\text{raw}} = \sigma_j \widehat{y}_{\text{scaled}} + \mu_j.
+\]
+输入张量 $X$ 的前 7 维走标准化通道，后 2 维（month/season）保持整数原值。
+
+\subsection{自回归滚动}
+设当前滑动窗口为 $\widetilde{\mat{X}} \in \R^{T_{\text{in}}\times 9}$。
+对 $k = 0, 1, \dots, T_{\text{out}}-1$ 循环：
+\begin{align}
+\widehat{\mat{Y}}^{(k)} &= f_{\theta}(\widetilde{\mat{X}})[-1, :7] \in \R^{7},\\
+\widetilde{\mat{X}}_{\text{new}} &=
+\Bigl[\,\widetilde{\mat{X}}[1:, :];\; \bigl[\widehat{\mat{Y}}^{(k)};\; m_{k+1};\; s_{k+1}\bigr]\,\Bigr].
+\end{align}
+即每步用模型预测的下一时刻污染物 7 维拼接上从输入序列尾部或外部传入的
+月/季 $m_{k+1}, s_{k+1}$，整体向前滚动一步。
+
+\subsection{软饱和（避免硬裁剪压扁预测）}
+对 $T_{\text{out}}$ 个逆缩放后的预测 $\widehat{\mat{Y}}_{\text{raw}} \in \R^{T_{\text{out}}\times 7}$，
+逐特征施加软饱和 $\psi_m(y)$，物理上界 $m$ 在 AQI/CO 上分别为 500/50，其余 $\infty$。
+\[
+e = \max(y - m,\, 0),\qquad
+\psi_m(y) = \begin{cases}
+y, & e = 0,\\
+m - s\,\log\!\bigl(1 + e/s\bigr), & e > 0,
+\end{cases}
+\qquad s = 20.
+\]
+该映射在 $y = m$ 处连续可导，且 $\psi_m(y) < m$（$e$ 越大压制越强，渐近下界 $m - s\ln(e/s)$）。
+最后再硬裁剪到下界 0：
+\[
+\widehat{\mat{Y}}_{\text{final}} = \max(\psi_m(\widehat{\mat{Y}}_{\text{raw}}),\, 0).
+\]
+
+\subsection{回测（backtest）}
+对 $N_{\text{sample}} = N - T_{\text{in}} - T_{\text{out}} + 1$ 个起点，
+每个起点执行一次自回归 3 日预测，拼接得到
+\[
+\widehat{\mat{Y}}_{\text{bt}} \in \R^{N_{\text{sample}}\times T_{\text{out}}\times 7},\qquad
+\mat{Y}_{\text{bt}} \in \R^{N_{\text{sample}}\times T_{\text{out}}\times 7}.
+\]
+对二者计算 MSE/MAE/RMSE/R²，绘制 7 子图（每污染物一张）真实 vs 预测对比。
+
+% =============================================================================
+\section{权重初始化}
+% =============================================================================
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Linear}：Xavier 均匀初始化 $\mat{W} \sim U\!\bigl(-\sqrt{6/(n_{\text{in}} + n_{\text{out}})},\,\sqrt{6/(n_{\text{in}} + n_{\text{out}})}\bigr)$，偏置 $\vect{b} = \vect{0}$；
+  \item \textbf{Conv1d}：Kaiming 正态（fan-out, ReLU）；
+  \item \textbf{LSTM}：输入权重 Xavier、循环权重正交、偏置 $\vect{0}$。
+\end{itemize}
+
+% =============================================================================
+\section{小结}
+% =============================================================================
+本系统以 14 天 ×9 维的输入序列预测 3 天 ×7 维的污染物浓度，集合了
+Transformer（全局注意力 + 残差捷径 + 逐特征门控）、
+LSTM（双向多层门控）、
+CNN（多尺度卷积）、
+Hybrid（三分支 + 六路交叉注意力 + softmax 加权）以及
+Ensemble（加权平均）共 5 种模型族。
+
+训练侧采用 Adam + OneCycleLR + 梯度裁剪 + 早停 + 反平滑早停，
+损失侧在 MSE 之上叠加方差与差分下界惩罚，缓解"均值回归"导致的
+预测塌缩。推理侧使用 14 天窗口的自回归预测，并以软饱和代替
+硬裁剪，保证极端污染事件能正常显示且符合物理下界。
+
+% =============================================================================
+\appendix
+\section{超参数一览（默认配置）}
+% =============================================================================
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+模块 & 参数 & 默认值 \\ \midrule
+模型 & $d_{\text{in}}$ / $d_{\text{out}}$ & 9 / 7 \\
+     & $d$（Transformer/Hybrid d\_model） & 128 \\
+     & $H$（LSTM hidden） & 256 \\
+     & $F$（CNN filters） & 128 \\
+     & $h$（nhead） & 4 \\
+     & $L$（num\_layers） & 4 \\
+     & $\mathrm{dropout}$ & 0.1 \\ \midrule
+训练 & epochs & 250 \\
+     & batch\_size & 32 \\
+     & $\eta_0$ & $3\times 10^{-4}$ \\
+     & $\eta_{\max}$ & $3\times 10^{-3}$ \\
+     & weight\_decay & $1\times 10^{-4}$ \\
+     & grad\_clip & 1.0 \\
+     & early\_stop\_patience & 40 \\
+     & loss\_type & mse\_antismooth \\ \midrule
+AntiSmoothing & $\lambda_{\text{var}},\, \lambda_{\text{diff}}$ & 0.1, 0.05 \\
+              & $\tau_{\text{var}},\, \tau_{\text{diff}}$ & 0.5, 0.5 \\
+              & $E_{\text{warm}}$ & 20 \\
+              & smoothing\_threshold & 0.1 \\
+              & smoothing\_stop\_patience & 15 \\ \midrule
+数据 & $T_{\text{in}}$, $T_{\text{out}}$ & 14, 3 \\
+     & $\rho$ & 0.8 \\ \midrule
+推理 & soft\_clip scale & 20.0 \\
+     & 硬上界（AQI / CO） & 500 / 50 \\
+\bottomrule
+\end{tabular}
+\caption{关键超参数默认值一览。}
+\end{table}
+
+\end{document}

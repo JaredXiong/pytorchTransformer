@@ -5,6 +5,7 @@
     python -m scripts.evaluate
     python -m scripts.evaluate --model lstm
     python -m scripts.evaluate --days 7
+    python -m scripts.evaluate --model transformer --report-over-smoothing
 """
 import argparse
 import logging
@@ -26,6 +27,7 @@ for p in (PROJECT_ROOT, SRC_ROOT):
 from air_quality.config import config
 from air_quality.data import AirQualityDataProcessor
 from air_quality.inference import AirQualityPredictor
+from air_quality.training.metrics import MetricsTracker
 from air_quality.visualization import plot_backtest_results
 
 logging.basicConfig(
@@ -44,7 +46,42 @@ def parse_args():
                         help=f'预测天数 (默认 {config.data.prediction_days})')
     parser.add_argument('--data-file', default=config.data.data_file,
                         help=f'数据文件路径 (默认 {config.data.data_file})')
+    # 反平滑报告
+    parser.add_argument(
+        '--report-over-smoothing', dest='report_over_smoothing', action='store_true', default=True,
+        help='打印反平滑检测结果（默认开）',
+    )
+    parser.add_argument(
+        '--no-report-over-smoothing', dest='report_over_smoothing', action='store_false',
+        help='关闭反平滑报告',
+    )
+    parser.add_argument('--smoothing-threshold', type=float, default=0.1,
+                        help='反平滑阈值（默认 0.1）')
     return parser.parse_args()
+
+
+def _report_over_smoothing(y_true, y_pred, threshold: float) -> None:
+    """打印每个污染物的 std_ratio、diff_ratio 和是否被标记为过度平滑。"""
+    feature_names = ['aqi', 'pm2_5', 'pm10', 'no2', 'so2', 'co', 'o3']
+    n_features = min(len(feature_names), y_true.shape[-1])
+    logger.info("\n反平滑检测 (阈值 threshold=%.2f):", threshold)
+    logger.info("  %-8s  %-10s  %-10s  %s", "feature", "std_ratio", "diff_ratio", "flag")
+    flagged = []
+    for i, name in enumerate(feature_names[:n_features]):
+        true_std = float(np.std(y_true[..., i]))
+        pred_std = float(np.std(y_pred[..., i]))
+        std_ratio = pred_std / (true_std + 1e-8)
+        true_diff = float(np.diff(y_true[..., i]).std())
+        pred_diff = float(np.diff(y_pred[..., i]).std())
+        diff_ratio = pred_diff / (true_diff + 1e-8)
+        flag = std_ratio < threshold or diff_ratio < threshold
+        if flag:
+            flagged.append(name)
+        logger.info("  %-8s  %-10.4f  %-10.4f  %s", name, std_ratio, diff_ratio,
+                    "OVER-SMOOTH" if flag else "ok")
+    logger.info("  合计: %d / %d 个污染物被标记为过度平滑", len(flagged), n_features)
+    if flagged:
+        logger.info("  被标记: %s", ", ".join(flagged))
 
 
 def main() -> int:
@@ -58,6 +95,7 @@ def main() -> int:
             prediction_days=args.days,
             rolling_windows=config.data.rolling_windows,
             output_size=config.model.output_size,
+            scaler_on_uncapped=config.data.scaler_on_uncapped,
         )
         data, scaler, features, dates = processor.load_and_preprocess_data(args.data_file)
         logger.info(f"数据加载完成: {len(data)} 天, {len(features)} 污染物")
@@ -106,6 +144,13 @@ def main() -> int:
         logger.info("\n分特征指标 (RMSE):")
         for feature in ['aqi', 'pm2_5', 'pm10', 'no2', 'so2', 'co', 'o3']:
             logger.info(f"  {feature}: {metrics[f'{feature}_rmse']:.4f}")
+
+        # 反平滑报告
+        if args.report_over_smoothing:
+            try:
+                _report_over_smoothing(result['y_true'], result['y_pred'], args.smoothing_threshold)
+            except Exception as e:  # pragma: no cover
+                logger.warning("反平滑报告失败: %s", e)
 
         # 画图：每个指标独立图表，保存到 outputs/figures/<model_type>/
         # y_true_raw 是原始未裁剪的真值，让 y 轴反映真实数据范围

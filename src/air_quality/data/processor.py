@@ -30,7 +30,7 @@ class AirQualityDataProcessor:
 
     def __init__(self, feature_columns: List[str] = None, seq_length: int = 14,
                  prediction_days: int = 3, rolling_windows: List[int] = None,
-                 output_size: int = 7):
+                 output_size: int = 7, scaler_on_uncapped: bool = True):
         self.feature_columns = feature_columns or [
             'aqi', 'pm2_5_24h', 'pm10_24h', 'no2_24h', 'so2_24h', 'co_24h', 'o3_8h_24h',
             'month', 'season'
@@ -39,6 +39,7 @@ class AirQualityDataProcessor:
         self.seq_length = seq_length
         self.prediction_days = prediction_days
         self.rolling_windows = rolling_windows if rolling_windows is not None else []
+        self.scaler_on_uncapped = scaler_on_uncapped
         self.scaler = None
         self.imputer = None
         self.stats: Optional[DataStats] = None
@@ -48,6 +49,9 @@ class AirQualityDataProcessor:
 
         返回的 data 形状为 (N, 9)：前 7 列为缩放后的污染物，后 2 列为原始 month/season 整数。
         scaler 仅拟合 7 个污染物特征。
+
+        反平滑（scaler_on_uncapped=True，默认）：scaler 在 **未裁剪** 数据上 fit，
+        clip 仅作用于后续 create_sequences 的训练目标，保留真实分布的动态范围。
         """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"数据文件不存在: {file_path}")
@@ -75,10 +79,18 @@ class AirQualityDataProcessor:
             raise ValueError(f"可用污染物特征不足，仅找到 {len(pollutant_features)} 个特征")
 
         # 污染物数据预处理
-        poll_data = df[pollutant_features].values
-        poll_data = self._handle_outliers(poll_data, pollutant_features)
+        raw_poll_data = df[pollutant_features].values
+
+        # 拆分裁剪：scaler_on_uncapped=True 时保留一份未裁剪数据用于 fit scaler
+        if self.scaler_on_uncapped:
+            # 对 NaN/缺失值先做一次中位数填补（仅用于 scaler fit），不影响后续裁剪+impute 路径
+            from sklearn.impute import SimpleImputer as _SI
+            scaler_fit_data = _SI(strategy='median').fit_transform(raw_poll_data)
+
+        # clip + impute 主路径
+        clipped_poll_data = self._handle_outliers(raw_poll_data, pollutant_features)
         self.imputer = SimpleImputer(strategy='mean')
-        poll_data = self.imputer.fit_transform(poll_data)
+        poll_data = self.imputer.fit_transform(clipped_poll_data)
 
         # 滚动统计特征（仅作用于污染物，默认关闭）
         poll_df = pd.DataFrame(poll_data, columns=pollutant_features)
@@ -95,14 +107,17 @@ class AirQualityDataProcessor:
             poll_data = np.hstack([poll_data, rolling_data])
 
         # 标准化（仅对污染物）
+        # 关键：scaler 在未裁剪数据上 fit（如果启用），让 inverse_transform 保留宽动态范围
         self.scaler = StandardScaler()
-        scaled_pollutants = self.scaler.fit_transform(poll_data)
+        if self.scaler_on_uncapped:
+            self.scaler.fit(scaler_fit_data)
+        scaled_pollutants = self.scaler.transform(poll_data)
 
         # 拼接日历特征（month/season 原始整数，不缩放）
         calendar = df[['month', 'season']].values
         data = np.hstack([scaled_pollutants, calendar])
 
-        # 记录 scaler 的特征名
+        # 记录 scaler 的特征名（用 pollutant_features，未含滚动列名以保持向后兼容）
         self.scaler.feature_names_in_ = list(poll_df.columns) + [
             f'rolling_{w}' for w in self.rolling_windows
             for _ in range(len(pollutant_features) * 2)
@@ -144,7 +159,11 @@ class AirQualityDataProcessor:
         return column_mapping
 
     def _handle_outliers(self, data: np.ndarray, feature_names: List[str]) -> np.ndarray:
-        """处理数据中的异常值"""
+        """处理数据中的异常值
+
+        Returns:
+            handled_data: 与 data 同形状、按列 clip 后的数组
+        """
         handled_data = data.copy()
         for i, feature in enumerate(feature_names):
             if not np.issubdtype(data[:, i].dtype, np.number):

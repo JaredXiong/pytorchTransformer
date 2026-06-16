@@ -5,6 +5,7 @@
     python -m scripts.train                        # 训练默认 Hybrid 模型
     python -m scripts.train --model lstm           # 训练指定模型
     python -m scripts.train --epochs 50            # 自定义训练轮数
+    python -m scripts.train --model transformer --loss-type mse_antismooth  # 反平滑训练
 """
 import argparse
 import logging
@@ -59,6 +60,7 @@ def prepare_data():
         prediction_days=config.data.prediction_days,
         rolling_windows=config.data.rolling_windows,
         output_size=config.model.output_size,
+        scaler_on_uncapped=config.data.scaler_on_uncapped,
     )
     data, scaler, features, dates = processor.load_and_preprocess_data(config.data.data_file)
     logger.info(f"数据加载完成，特征数量: {len(features)}, 数据点数量: {len(data)}")
@@ -113,6 +115,12 @@ def log_training_summary(history: dict) -> None:
     logger.info(f"  总训练轮次: {history.get('epochs_trained', 0)}")
     logger.info(f"  最佳轮次: {history.get('best_epoch', 0) + 1}")
     logger.info(f"  最佳验证损失: {history.get('best_loss', float('inf')):.6f}")
+    if history.get('smoothing_stopped'):
+        logger.info("  ⚠ 训练因反平滑检测触发提前停止")
+    flags = history.get('smoothing_flags_per_epoch', [])
+    if flags:
+        last = flags[-1]
+        logger.info(f"  最终 epoch 过度平滑标记: {last['n_flagged']}/{len(last.get('flags', {}))}")
 
 
 def run_prediction_example(raw_data, dates) -> None:
@@ -146,12 +154,33 @@ def train_single_model(model_type: str, train_loader, test_loader, device) -> Di
     logger.info(f"训练模型: {model_type}")
     logger.info(f"{'=' * 60}")
 
+    # 模型工厂参数
+    model_kwargs = {'dropout': config.model.dropout}
+    if model_type == 'transformer':
+        # 把 transformer 专用反平滑参数传入
+        model_kwargs.update({
+            'residual_weight': config.model.transformer_residual_weight,
+            'feature_scale_init': config.model.transformer_feature_scale_init,
+            'ffn_mult': config.model.transformer_ffn_mult,
+            'norm_first': config.model.transformer_norm_first,
+        })
+
     model = create_model(
         model_type,
         input_size=config.model.input_size,
         output_size=config.model.output_size,
-        dropout=config.model.dropout,
+        **model_kwargs,
     ).to(device)
+
+    # 反平滑损失 kwargs
+    loss_kwargs = {
+        'delta': config.training.delta,
+        'lambda_var': config.training.lambda_var,
+        'lambda_diff': config.training.lambda_diff,
+        'tau_var': config.training.tau_var,
+        'tau_diff': config.training.tau_diff,
+        'lambda_warmup_epochs': config.training.lambda_warmup_epochs,
+    }
 
     trainer = ModelTrainer(
         model=model,
@@ -163,6 +192,11 @@ def train_single_model(model_type: str, train_loader, test_loader, device) -> Di
         early_stop_patience=config.training.early_stop_patience,
         gradient_clip=config.training.gradient_clip,
         learning_rate=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+        loss_kwargs=loss_kwargs,
+        detect_smoothing=config.training.detect_smoothing,
+        smoothing_threshold=config.training.smoothing_threshold,
+        smoothing_stop_patience=config.training.smoothing_stop_patience,
     )
 
     start = time.time()
@@ -186,6 +220,42 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, help='覆盖batch size')
     parser.add_argument('--lr', type=float, help='覆盖学习率')
     parser.add_argument('--epochs', type=int, help='覆盖训练轮数')
+    # 损失与正则化
+    parser.add_argument(
+        '--loss-type', default=None,
+        choices=['mse', 'huber', 'mae', 'smooth_l1', 'mse_antismooth'],
+        help='损失函数类型（默认从 config 读取）',
+    )
+    parser.add_argument('--delta', type=float, help='Huber 损失 delta')
+    parser.add_argument('--dropout', type=float, help='模型 dropout')
+    parser.add_argument('--weight-decay', type=float, help='L2 正则化系数')
+    parser.add_argument('--early-stop', type=int, dest='early_stop', help='早停耐心值')
+    parser.add_argument('--gradient-clip', type=float, help='梯度裁剪阈值')
+    # 反平滑检测
+    parser.add_argument(
+        '--detect-smoothing', dest='detect_smoothing', action='store_true', default=None,
+        help='启用反平滑检测作为额外早停信号',
+    )
+    parser.add_argument(
+        '--no-detect-smoothing', dest='detect_smoothing', action='store_false', default=None,
+        help='关闭反平滑检测',
+    )
+    parser.add_argument('--smoothing-threshold', type=float, help='反平滑阈值 (std/diff_ratio < thresh 视为平滑)')
+    parser.add_argument('--smoothing-stop-patience', type=int, help='反平滑早停耐心值')
+    # 反平滑损失权重
+    parser.add_argument('--lambda-var', dest='lambda_var', type=float, help='方差下界惩罚权重')
+    parser.add_argument('--lambda-diff', dest='lambda_diff', type=float, help='一阶差分下界惩罚权重')
+    parser.add_argument('--tau-var', dest='tau_var', type=float, help='方差下界阈值（pred/true std 最小比）')
+    parser.add_argument('--tau-diff', dest='tau_diff', type=float, help='一阶差分下界阈值')
+    # 数据与推理
+    parser.add_argument(
+        '--no-cap-training-data', dest='no_cap_training_data', action='store_true', default=False,
+        help='使用旧行为：scaler 在裁剪后数据上 fit（不推荐）',
+    )
+    parser.add_argument(
+        '--no-soft-clip', dest='no_soft_clip', action='store_true', default=False,
+        help='关闭推理软饱和（恢复硬裁剪）',
+    )
     return parser.parse_args()
 
 
@@ -195,12 +265,43 @@ def main() -> int:
         logger.info("空气质量预测系统启动")
         setup_directories()
 
+        # 把 CLI 覆盖写入 config
         if args.batch_size:
             config.training.batch_size = args.batch_size
         if args.lr:
             config.training.learning_rate = args.lr
         if args.epochs:
             config.training.epochs = args.epochs
+        if args.loss_type is not None:
+            config.training.loss_type = args.loss_type
+        if args.delta is not None:
+            config.training.delta = args.delta
+        if args.dropout is not None:
+            config.model.dropout = args.dropout
+        if args.weight_decay is not None:
+            config.training.weight_decay = args.weight_decay
+        if args.early_stop is not None:
+            config.training.early_stop_patience = args.early_stop
+        if args.gradient_clip is not None:
+            config.training.gradient_clip = args.gradient_clip
+        if args.detect_smoothing is not None:
+            config.training.detect_smoothing = args.detect_smoothing
+        if args.smoothing_threshold is not None:
+            config.training.smoothing_threshold = args.smoothing_threshold
+        if args.smoothing_stop_patience is not None:
+            config.training.smoothing_stop_patience = args.smoothing_stop_patience
+        if args.lambda_var is not None:
+            config.training.lambda_var = args.lambda_var
+        if args.lambda_diff is not None:
+            config.training.lambda_diff = args.lambda_diff
+        if args.tau_var is not None:
+            config.training.tau_var = args.tau_var
+        if args.tau_diff is not None:
+            config.training.tau_diff = args.tau_diff
+        if args.no_cap_training_data:
+            config.data.scaler_on_uncapped = False
+        if args.no_soft_clip:
+            config.prediction.soft_clip = False
 
         train_loader, test_loader, scaler, features, dates, data, raw_data, _ = prepare_data()
 
@@ -233,3 +334,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+

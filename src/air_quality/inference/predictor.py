@@ -18,6 +18,44 @@ from ..models import create_model
 logger = logging.getLogger(__name__)
 
 
+# 7 个污染物对应的硬上限（与 validate_prediction 保持一致）
+# AQI (idx 0) <= 500, CO (idx 5) <= 50；其他无限
+HARD_MAX_PER_FEATURE = np.array(
+    [500.0, np.inf, np.inf, np.inf, np.inf, 50.0, np.inf],
+    dtype=np.float64,
+)
+
+
+def _soft_saturate(arr: np.ndarray, max_per_feature: np.ndarray, scale: float) -> np.ndarray:
+    """对超过 max_per_feature 的部分做软饱和（不直接硬切）。
+
+    当 excess = max(arr - max, 0) > 0 时，输出 = max - scale * log1p(excess / scale)
+    性质：
+      - excess = 0（输入在 max 以下）：输出 == 原值（恒等映射，不破坏正常范围）
+      - excess > 0：输出 < max，且 excess 越大输出越低（趋近下界）
+      - scale 越大，过渡越平；scale 越小，过渡越陡
+    当 max 为 inf（无上限）时，原值直接返回。
+    """
+    arr = np.asarray(arr, dtype=np.float64)
+    max_per_feature = np.asarray(max_per_feature, dtype=np.float64)
+    if arr.shape[-1] != max_per_feature.shape[0]:
+        # 维度不匹配：退化为硬裁剪，保证数值稳定
+        clipped = arr.copy()
+        for i, m in enumerate(max_per_feature):
+            if np.isfinite(m):
+                clipped[..., i] = np.minimum(clipped[..., i], m)
+        return clipped
+    out = arr.copy()
+    for i, m in enumerate(max_per_feature):
+        if not np.isfinite(m):
+            continue
+        excess = np.maximum(arr[..., i] - m, 0.0)
+        # 仅对 excess > 0 处软饱和；excess == 0 处保留原值（恒等映射）
+        soft = m - scale * np.log1p(excess / scale)
+        out[..., i] = np.where(excess > 0, soft, arr[..., i])
+    return out
+
+
 class PredictionResult:
     """预测结果封装类"""
 
@@ -172,7 +210,15 @@ class AirQualityPredictor:
         predictions = self.scaler.inverse_transform(predictions)
         for i in range(predictions.shape[0]):
             predictions[i] = validate_prediction(predictions[i])
-        predictions = np.clip(predictions, a_min=0, a_max=500)
+        # 反平滑：软化硬裁剪（默认开启）。硬下限 0 仍保留（物理合理性），
+        # 硬上限（AQI=500、CO=50）改为软饱和，由 validate_prediction 在下一步硬保证。
+        if config.prediction.soft_clip:
+            predictions = _soft_saturate(
+                predictions,
+                max_per_feature=HARD_MAX_PER_FEATURE,
+                scale=config.prediction.soft_clip_scale,
+            )
+        predictions = np.maximum(predictions, 0)  # 物理下界 0 仍硬保证
 
         if future_dates is None:
             future_dates = [(datetime.now() + timedelta(days=i + 1)).strftime('%Y-%m-%d')
@@ -222,6 +268,15 @@ class AirQualityPredictor:
                 preds = self.scaler.inverse_transform(preds)
                 for i in range(preds.shape[0]):
                     preds[i] = validate_prediction(preds[i])
+                # 反平滑：与 forecast 保持一致，应用软饱和（默认开启）。
+                # 物理下界 0 仍由下一行硬保证。
+                if config.prediction.soft_clip:
+                    preds = _soft_saturate(
+                        preds,
+                        max_per_feature=HARD_MAX_PER_FEATURE,
+                        scale=config.prediction.soft_clip_scale,
+                    )
+                preds = np.maximum(preds, 0)
 
                 target_idx = slice(start + seq_len, start + seq_len + prediction_days)
                 true_scaled = data[target_idx, :7]

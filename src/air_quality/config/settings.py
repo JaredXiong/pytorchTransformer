@@ -15,7 +15,12 @@ class ModelConfig:
     nhead: int = 4  # 注意力头数量
     num_layers: int = 4  # 模型层数
     output_size: int = 7  # 预测目标维度（仅污染物，不含 month/season）
-    dropout: float = 0.2  # Dropout概率
+    dropout: float = 0.1  # Dropout概率（已降低以减弱均值回归倾向）
+    # Transformer 反平滑专用配置
+    transformer_residual_weight: float = 0.3  # 残差 shortcut 初始权重
+    transformer_feature_scale_init: float = 1.0  # feature_scale 初始值
+    transformer_ffn_mult: int = 4  # dim_feedforward = ffn_mult * d_model
+    transformer_norm_first: bool = True  # 显式 pre-LN，稳定深层训练
 
 
 @dataclass
@@ -24,11 +29,21 @@ class TrainingConfig:
     epochs: int = 250
     batch_size: int = 32
     learning_rate: float = 0.0003
-    weight_decay: float = 3e-4
+    weight_decay: float = 1e-4  # 已降低（从 3e-4）以减弱对低幅权重的偏好
     gradient_clip: float = 1.0
-    early_stop_patience: int = 60
-    loss_type: str = 'huber'
+    early_stop_patience: int = 40  # 已降低（从 60）以在保守解之前停下
+    loss_type: str = 'mse_antismooth'  # 已从 huber 切换到反平滑复合损失
     delta: float = 1.0
+    # 反平滑损失分量
+    lambda_var: float = 0.1
+    lambda_diff: float = 0.05
+    tau_var: float = 0.5
+    tau_diff: float = 0.5
+    lambda_warmup_epochs: int = 20
+    # 反平滑早停信号
+    detect_smoothing: bool = True
+    smoothing_threshold: float = 0.1
+    smoothing_stop_patience: int = 15
 
 
 @dataclass
@@ -48,6 +63,8 @@ class DataConfig:
     target_feature: str = 'aqi'  # 预测目标
     # 滚动统计特征窗口大小（暂时禁用以避免维度不匹配）
     rolling_windows: List[int] = field(default_factory=lambda: [])
+    # scaler 拟合阶段：True=在未裁剪数据上 fit（保留真实动态范围，clip 仅作用于训练目标）
+    scaler_on_uncapped: bool = True
 
 
 @dataclass
@@ -65,6 +82,9 @@ class PredictionConfig:
     min_prediction_value: float = 0.0
     max_prediction_value: float = 500.0
     feature_ratio_constraint: float = 1.0
+    # 软饱和：避免硬裁剪 0-500 二次压缩预测动态范围
+    soft_clip: bool = True
+    soft_clip_scale: float = 20.0
 
 
 @dataclass
@@ -72,7 +92,7 @@ class HybridModelConfig:
     """混合模型相关配置"""
     d_model: int = 128  # 隐藏层维度
     nhead: int = 4  # 注意力头数量
-    dropout: float = 0.2  # Dropout概率
+    dropout: float = 0.1  # Dropout概率（与 ModelConfig.dropout 对齐）
     residual_weight: float = 0.3  # 残差权重
 
 
