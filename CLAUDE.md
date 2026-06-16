@@ -15,9 +15,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```
 pytorchTransformer/
 ├── CLAUDE.md                       # 本文件
+├── README.md                       # 项目说明文档
 ├── requirements.txt                # 运行时依赖
 ├── .gitignore
 ├── docs/
+│   ├── algorithm_analysis.md       # 算法架构分析文档
 │   └── superpowers/                # 设计历史（specs + plans，详见末尾「设计文档」）
 │       ├── specs/
 │       └── plans/
@@ -35,10 +37,11 @@ pytorchTransformer/
 │       ├── data/                   # 数据加载、预处理、序列构造
 │       ├── models/                 # 模型架构
 │       │   ├── base.py             # BaseModel + PositionalEncoding
-│       │   ├── transformer.py
-│       │   ├── lstm.py             # LSTMModel + GRUModel
-│       │   ├── cnn.py              # CNNModel + TCNModel（TCN 有 bug，见下）
+│       │   ├── transformer.py      # TransformerModel
+│       │   ├── lstm.py             # LSTMModel
+│       │   ├── cnn.py              # CNNModel
 │       │   ├── hybrid.py           # HybridModel + Cross-Attention Fusion
+│       │   ├── ensemble.py         # EnsembleModel（加权平均融合多模型）
 │       │   └── factory.py          # create_model()
 │       ├── training/               # 训练器、损失、指标
 │       │   ├── trainer.py
@@ -49,7 +52,7 @@ pytorchTransformer/
 │       └── visualization/          # 训练曲线与预测对比图
 │           └── plots.py
 ├── scripts/                        # 命令行入口
-│   ├── train.py                    # 单模型训练 + 预测示例
+│   ├── train.py                    # 统一训练脚本（支持默认、调优、深度调优、集成学习）
 │   ├── compare_models.py           # 多模型对比
 │   └── evaluate.py                 # 回测评估 + 7 子图可视化
 └── tests/                          # 单元测试（unittest 框架，详见「测试」）
@@ -91,7 +94,7 @@ python -c "from air_quality import config, create_model, ModelTrainer, AirQualit
 测试使用 stdlib `unittest`（未引入 pytest），位于 `tests/`。
 
 ```bash
-# 跑全部测试（应在 16 个测试左右，耗时约 6 秒）
+# 跑全部测试（18 个测试，耗时约 13 秒）
 python -m unittest discover tests -v
 
 # 跑单个测试文件
@@ -104,8 +107,6 @@ python -m unittest tests.test_config.TestCalendarConfig.test_input_size_unchange
 python -m unittest tests.test_predictor.TestForecast.test_forecast_rejects_invalid_month -v
 ```
 
-`tests/test_models.py` 显式跳过 `tcn`（见下「已知问题」）。
-
 ## 架构设计
 
 ### 配置（`src/air_quality/config/settings.py`）
@@ -116,14 +117,15 @@ python -m unittest tests.test_predictor.TestForecast.test_forecast_rejects_inval
 |---|---|
 | `ModelConfig.input_size` | 9（7 污染物 + month + season）|
 | `ModelConfig.output_size` | 7（仅污染物，不含 month/season）|
-| `ModelConfig.d_model / lstm_hidden` | 128 |
-| `ModelConfig.cnn_filters` | 64 |
+| `ModelConfig.d_model` | 128 |
+| `ModelConfig.lstm_hidden` | 256 |
+| `ModelConfig.cnn_filters` | 128 |
 | `ModelConfig.nhead / num_layers` | 4 |
-| `TrainingConfig.epochs` | 150 |
+| `TrainingConfig.epochs` | 250 |
 | `TrainingConfig.batch_size` | 32 |
-| `TrainingConfig.learning_rate` | 0.001 |
-| `TrainingConfig.weight_decay` | 1e-4 |
-| `TrainingConfig.early_stop_patience` | 30 |
+| `TrainingConfig.learning_rate` | 0.0003 |
+| `TrainingConfig.weight_decay` | 3e-4 |
+| `TrainingConfig.early_stop_patience` | 60 |
 | `TrainingConfig.loss_type` | `huber` |
 | `TrainingConfig.gradient_clip` | 1.0 |
 | `DataConfig.data_file` | `data/raw/北京2015-2024.xlsx` |
@@ -149,18 +151,18 @@ python -m unittest tests.test_predictor.TestForecast.test_forecast_rejects_inval
 
 ### 模型（`src/air_quality/models/`）
 
-`BaseModel` 提供统一权重初始化与 `count_parameters`。共 6 种模型，全部通过 `create_model(model_type, input_size, output_size=7, **kwargs)` 工厂实例化：
+`BaseModel` 提供统一权重初始化与 `count_parameters`。共 4 种模型，全部通过 `create_model(model_type, input_size, output_size=7, **kwargs)` 工厂实例化：
 
 | `model_type` | 类 | 关键结构 |
 |---|---|---|
 | `transformer` | `TransformerModel` | Linear 投影 → PositionalEncoding → 4 层 TransformerEncoder (d_ff=512) → Linear 解码 |
 | `lstm` | `LSTMModel` | 4 层双向 LSTM (hidden=256, dropout=0.05) → 2× Linear |
-| `gru` | `GRUModel` | 同 LSTM，参数更少 |
 | `cnn` | `CNNModel` | 多尺度 Conv1d（kernel [3,5,7]）+ BN+ReLU+MaxPool → AdaptiveAvgPool → 2× Linear |
-| `tcn` | `TCNModel` | 4 个 TCNBlock（膨胀因果卷积 + 残差）→ Linear ⚠️ 有 bug，见下 |
 | `hybrid` | `HybridModel` | 共享 `input_proj` → TransformerBranch + LSTMEncoderBranch + CNNEncoderBranch → 各 `LightSelfAttention` → `CrossAttentionFusion`（6 路交叉注意力 + 可学习融合权重）→ FC + 可学习残差 |
 
 **新增模型**：在 `src/air_quality/models/` 下新建 `<name>.py`（继承 `BaseModel`），在 `factory.py` 的 `model_classes` 注册键。所有模型 forward 必须返回与输入等长的序列（time-step 数不变），最终层维度为 `output_size`（默认 7 = 仅污染物）。
+
+**集成模型**：`EnsembleModel` 通过加权平均融合多个模型的预测，用于提升预测稳定性。
 
 ### 训练（`src/air_quality/training/`）
 
@@ -201,7 +203,17 @@ python -m unittest tests.test_predictor.TestForecast.test_forecast_rejects_inval
 
 ### 可视化（`src/air_quality/visualization/plots.py`）
 
-5 个函数：`plot_training_history` / `plot_prediction_comparison` / `plot_feature_comparison`（含误差分布）/ `plot_metrics` / **`plot_backtest_results`**（3×3 子图回测对比，7 个污染物）。matplotlib 后端强制 `Agg` 非交互式，支持中文（`SimHei` / `Microsoft YaHei`）。
+5 个函数：`plot_training_history` / `plot_prediction_comparison` / `plot_feature_comparison`（含误差分布）/ `plot_metrics` / **`plot_backtest_results`**（每个污染物独立一张图，按模型保存到 `outputs/figures/<model_type>/`）。matplotlib 后端强制 `Agg` 非交互式，支持中文（`SimHei` / `Microsoft YaHei`）。
+
+**`plot_backtest_results` 关键参数**：
+
+| 参数 | 类型 | 含义 |
+|---|---|---|
+| `y_true` | `(N, prediction_days, 7)` | 模型推理时获取的真值（来自预处理后的数据，已被 `_handle_outliers` 裁剪）|
+| `y_pred` | `(N, prediction_days, 7)` | 模型预测值 |
+| `y_true_raw` | `(N, prediction_days, 7)` 可选 | **原始未裁剪真值**。若传入，图表使用它绘制"真实值"曲线，让 y 轴反映真实数据范围 |
+
+**Y 轴准确性修复**：`_handle_outliers` 在预处理时将 AQI 硬编码上限 500、CO 上限 50、其他污染物用 `Q3+3IQR`，导致 `y_true` 被强行截断、matplotlib 自动按截断后的范围决定 y 轴。`scripts/evaluate.py` 会重新加载 Excel 原始数据并按窗口对齐成 `y_true_raw` 传入图表函数，确保极端污染事件（AQI > 500、CO > 50、PM2.5/PM10 > 500 等）能正常显示。
 
 ## 数据特征（9 维）
 
@@ -214,11 +226,7 @@ python -m unittest tests.test_predictor.TestForecast.test_forecast_rejects_inval
 - **新增损失/指标**：在 `src/air_quality/training/losses.py` 或 `metrics.py` 添加，在 `__init__.py` 导出。
 - **换数据文件**：把 Excel 放到 `data/raw/` 下，或修改 `DataConfig.data_file`。
 - **改预测天数**：`DataConfig.prediction_days`；scaler 训练时的特征数（9）需 ≥ 该值。
-- **改训练入口参数**：`scripts/train.py` 已支持 `--model` / `--epochs`，可继续扩展。
-
-## 已知问题
-
-- **TCNModel 残差 shape 不匹配**：`src/air_quality/models/cnn.py:TCNModel` 在 `dilation > 1` 时 `TCNBlock` 的残差连接形状不一致（输入与卷积输出 seq_len 不同），会触发 `RuntimeError: The size of tensor a (18) must match the size of tensor b (14)`。**当前未修复**——`tests/test_models.py` 显式跳过 `tcn`，`scripts/compare_models.py` 的默认模型列表也未包含 `tcn`。如需启用 TCN，需要在 `TCNBlock` 内对卷积输出做 `crop` 或对输入做 `pad`，使残差 shape 对齐。
+- **改训练入口参数**：`scripts/train.py` 已支持 `--model` / `--epochs` / `--batch-size` / `--lr`，可继续扩展。
 
 ## 设计文档
 

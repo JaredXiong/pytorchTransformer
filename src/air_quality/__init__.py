@@ -16,10 +16,9 @@ from .models import (
     BaseModel,
     TransformerModel,
     LSTMModel,
-    GRUModel,
     CNNModel,
-    TCNModel,
     HybridModel,
+    EnsembleModel,
     create_model,
 )
 from .training import ModelTrainer, MetricsTracker, get_loss_function, WeightedMSELoss
@@ -36,7 +35,7 @@ from .visualization import (
     plot_metrics,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.0.2"
 __all__ = [
     # config
     "config",
@@ -51,10 +50,9 @@ __all__ = [
     "BaseModel",
     "TransformerModel",
     "LSTMModel",
-    "GRUModel",
     "CNNModel",
-    "TCNModel",
     "HybridModel",
+    "EnsembleModel",
     "create_model",
     # training
     "ModelTrainer",

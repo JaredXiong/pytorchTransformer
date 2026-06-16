@@ -71,7 +71,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description='Compare all model variants')
     parser.add_argument(
         '--models', nargs='+', default=MODEL_TYPES,
-        choices=['transformer', 'lstm', 'gru', 'cnn', 'tcn', 'hybrid'],
+        choices=['transformer', 'lstm', 'cnn', 'hybrid'],
         help='要比较的模型列表',
     )
     args = parser.parse_args()

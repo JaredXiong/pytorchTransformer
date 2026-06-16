@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 import time
-from datetime import timedelta
+from typing import Dict, Any
 
 import joblib
 import numpy as np
@@ -26,10 +26,11 @@ for p in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, p)
 
 from air_quality.config import config
-from air_quality.data import AirQualityDataProcessor, split_data
+from air_quality.data import AirQualityDataProcessor, split_data, get_device
 from air_quality.models import create_model
 from air_quality.training import ModelTrainer
 from air_quality.inference import predict_air_quality, format_prediction_result
+from air_quality.visualization import plot_training_history
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,35 +93,7 @@ def prepare_data():
     return train_loader, test_loader, scaler, features, dates, data, raw_data, processor
 
 
-def train_model(model_type: str, train_loader, test_loader, device):
-    """训练指定类型的模型"""
-    logger.info(f"创建模型类型: {model_type}")
-    model = create_model(
-        model_type=model_type,
-        input_size=config.model.input_size,
-        output_size=config.model.output_size,
-    ).to(device)
-
-    trainer = ModelTrainer(
-        model=model,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        device=device,
-        best_model_path=config.file.model_save_path,
-        loss_type=config.training.loss_type,
-        early_stop_patience=config.training.early_stop_patience,
-        gradient_clip=config.training.gradient_clip,
-        learning_rate=config.training.learning_rate,
-    )
-
-    logger.info(f"开始训练 {model_type} 模型 ...")
-    start = time.time()
-    trainer.train(num_epochs=config.training.epochs)
-    logger.info(f"训练完成，耗时: {time.time() - start:.2f} 秒")
-    return model, trainer.history
-
-
-def save_artifacts(model, scaler, model_type: str) -> None:
+def save_artifacts(model, scaler) -> None:
     """保存模型权重与标准化器"""
     torch.save(
         {
@@ -153,20 +126,66 @@ def run_prediction_example(raw_data, dates) -> None:
     logger.info("执行预测示例")
     sample_input = raw_data[-config.data.seq_length:]
 
+    last_date = pd.to_datetime(dates.iloc[-1])
+    future_dates = [
+        (last_date + pd.Timedelta(days=i + 1)).strftime('%Y-%m-%d')
+        for i in range(config.data.prediction_days)
+    ]
+
     prediction_result = predict_air_quality(
         input_sequence=sample_input,
         num_days=config.data.prediction_days,
+        future_dates=future_dates,
     )
     print(format_prediction_result(prediction_result, show_details=True))
+
+
+def train_single_model(model_type: str, train_loader, test_loader, device) -> Dict[str, Any]:
+    """训练单个模型并返回结果"""
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"训练模型: {model_type}")
+    logger.info(f"{'=' * 60}")
+
+    model = create_model(
+        model_type,
+        input_size=config.model.input_size,
+        output_size=config.model.output_size,
+        dropout=config.model.dropout,
+    ).to(device)
+
+    trainer = ModelTrainer(
+        model=model,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        device=device,
+        best_model_path=config.file.model_save_path,
+        loss_type=config.training.loss_type,
+        early_stop_patience=config.training.early_stop_patience,
+        gradient_clip=config.training.gradient_clip,
+        learning_rate=config.training.learning_rate,
+    )
+
+    start = time.time()
+    trainer.train(num_epochs=config.training.epochs)
+    elapsed = time.time() - start
+
+    return {
+        'model': model,
+        'history': trainer.history,
+        'training_time': elapsed,
+    }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Air Quality Time-Series Training')
     parser.add_argument(
         '--model', default='hybrid',
-        choices=['transformer', 'lstm', 'gru', 'cnn', 'tcn', 'hybrid'],
+        choices=['transformer', 'lstm', 'cnn', 'hybrid'],
         help='要训练的模型类型 (默认: hybrid)',
     )
+    parser.add_argument('--batch-size', type=int, help='覆盖batch size')
+    parser.add_argument('--lr', type=float, help='覆盖学习率')
+    parser.add_argument('--epochs', type=int, help='覆盖训练轮数')
     return parser.parse_args()
 
 
@@ -174,17 +193,32 @@ def main() -> int:
     args = parse_args()
     try:
         logger.info("空气质量预测系统启动")
-
         setup_directories()
+
+        if args.batch_size:
+            config.training.batch_size = args.batch_size
+        if args.lr:
+            config.training.learning_rate = args.lr
+        if args.epochs:
+            config.training.epochs = args.epochs
+
         train_loader, test_loader, scaler, features, dates, data, raw_data, _ = prepare_data()
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = get_device()
         logger.info(f"使用设备: {device}")
 
-        model, history = train_model(args.model, train_loader, test_loader, device)
-        save_artifacts(model, scaler, model_type=args.model)
+        result = train_single_model(args.model, train_loader, test_loader, device)
+        model = result['model']
+        history = result['history']
+
+        save_artifacts(model, scaler)
         log_training_summary(history)
         run_prediction_example(raw_data, dates)
+
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        plot_path = os.path.join(config.file.figures_dir, f'training_history_{args.model}_{timestamp}.png')
+        plot_training_history(history, save_path=plot_path)
+        logger.info(f"训练历史图表已保存到: {plot_path}")
 
         logger.info("空气质量预测系统执行完成")
         return 0

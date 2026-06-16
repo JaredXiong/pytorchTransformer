@@ -250,14 +250,15 @@ class AirQualityPredictor:
 def predict_air_quality(model_weights_path: str = None,
                         scaler_path: str = None,
                         input_sequence: np.ndarray = None,
-                        num_days: int = None) -> dict:
+                        num_days: int = None,
+                        future_dates: list = None) -> dict:
     """便捷预测函数 — 等价于 AirQualityPredictor.forecast()。"""
     if input_sequence is None:
         raise ValueError("必须提供输入序列数据")
 
     predictor = AirQualityPredictor(model_weights_path, scaler_path)
     predictor.load_model()
-    return predictor.forecast(input_sequence)
+    return predictor.forecast(input_sequence, future_dates=future_dates)
 
 
 def format_prediction_result(result: Dict[str, Any], show_details: bool = True) -> str:

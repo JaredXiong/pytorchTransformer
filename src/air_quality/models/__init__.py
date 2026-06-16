@@ -3,9 +3,10 @@
 """
 from .base import BaseModel, PositionalEncoding
 from .transformer import TransformerModel
-from .lstm import LSTMModel, GRUModel
-from .cnn import CNNModel, TCNModel
+from .lstm import LSTMModel
+from .cnn import CNNModel
 from .hybrid import HybridModel
+from .ensemble import EnsembleModel
 from .factory import create_model
 
 __all__ = [
@@ -13,9 +14,8 @@ __all__ = [
     'PositionalEncoding',
     'TransformerModel',
     'LSTMModel',
-    'GRUModel',
     'CNNModel',
-    'TCNModel',
     'HybridModel',
+    'EnsembleModel',
     'create_model',
 ]

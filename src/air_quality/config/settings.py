@@ -10,8 +10,8 @@ class ModelConfig:
     """模型相关配置"""
     input_size: int = 9  # 输入特征数量
     d_model: int = 128  # Transformer隐藏层维度
-    lstm_hidden: int = 128  # LSTM隐藏层维度
-    cnn_filters: int = 64  # CNN过滤器数量
+    lstm_hidden: int = 256  # LSTM隐藏层维度
+    cnn_filters: int = 128  # CNN过滤器数量
     nhead: int = 4  # 注意力头数量
     num_layers: int = 4  # 模型层数
     output_size: int = 7  # 预测目标维度（仅污染物，不含 month/season）
@@ -21,12 +21,12 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """训练相关配置"""
-    epochs: int = 150
+    epochs: int = 250
     batch_size: int = 32
-    learning_rate: float = 0.001
-    weight_decay: float = 1e-4
+    learning_rate: float = 0.0003
+    weight_decay: float = 3e-4
     gradient_clip: float = 1.0
-    early_stop_patience: int = 30
+    early_stop_patience: int = 60
     loss_type: str = 'huber'
     delta: float = 1.0
 

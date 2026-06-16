@@ -121,6 +121,7 @@ class AirQualityDataProcessor:
 
     def _create_column_mapping(self, columns) -> dict:
         """创建列名映射字典"""
+        import re
         column_mapping = {}
         mapping_rules = [
             ('aqi', ['aqi', '空气质量指数']),
@@ -135,7 +136,8 @@ class AirQualityDataProcessor:
             for col in columns:
                 col_lower = col.lower().replace(' ', '').replace('_', '')
                 for pattern in patterns:
-                    if pattern.lower().replace(' ', '') in col_lower:
+                    pattern_norm = pattern.lower().replace(' ', '')
+                    if re.search(r'\b' + re.escape(pattern_norm), col_lower):
                         if col not in column_mapping:
                             column_mapping[col] = target_name
                         break
@@ -147,8 +149,8 @@ class AirQualityDataProcessor:
         for i, feature in enumerate(feature_names):
             if not np.issubdtype(data[:, i].dtype, np.number):
                 continue
-            Q1 = np.percentile(data[:, i], 25)
-            Q3 = np.percentile(data[:, i], 75)
+            Q1 = np.nanpercentile(data[:, i], 25)
+            Q3 = np.nanpercentile(data[:, i], 75)
             IQR = Q3 - Q1
             lower_bound = max(0, Q1 - 1.5 * IQR)
             if 'aqi' in feature.lower():

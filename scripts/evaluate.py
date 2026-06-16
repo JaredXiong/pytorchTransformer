@@ -13,6 +13,9 @@ import sys
 import time
 from datetime import datetime
 
+import numpy as np
+import pandas as pd
+
 # 让 `python -m scripts.evaluate` 能 import air_quality
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_ROOT = os.path.join(PROJECT_ROOT, 'src')
@@ -59,6 +62,30 @@ def main() -> int:
         data, scaler, features, dates = processor.load_and_preprocess_data(args.data_file)
         logger.info(f"数据加载完成: {len(data)} 天, {len(features)} 污染物")
 
+        # 重新加载原始未裁剪数据，用于图表的"真实值"曲线
+        # 否则 _handle_outliers 会将 AQI 裁剪到 ≤500、CO 裁剪到 ≤50，
+        # 导致图表 y 轴被强行压缩，无法反映真实数据范围。
+        raw_df = pd.read_excel(args.data_file, engine='openpyxl')
+        column_mapping = processor._create_column_mapping(raw_df.columns)
+        raw_df = raw_df.rename(columns=column_mapping)
+        # 按 processor 实际使用的 7 个污染物顺序提取原始数据
+        available_features = [c for c in features if c in raw_df.columns]
+        raw_pollutants = raw_df[available_features].values
+        if raw_pollutants.shape[1] < 7:
+            logger.warning(
+                f"原始数据仅找到 {raw_pollutants.shape[1]} 个污染物列，"
+                f"图表将使用预处理后的真值（可能被裁剪）"
+            )
+            y_true_raw = None
+        else:
+            # 对齐窗口：每个窗口预测的目标是 data[start+seq_len : start+seq_len+prediction_days]
+            seq_len = config.data.seq_length
+            n_samples = len(data) - seq_len - args.days + 1
+            y_true_raw = np.array([
+                raw_pollutants[start + seq_len:start + seq_len + args.days]
+                for start in range(n_samples)
+            ], dtype=float)
+
         # 加载预测器
         predictor = AirQualityPredictor()
         predictor.load_model()
@@ -80,19 +107,16 @@ def main() -> int:
         for feature in ['aqi', 'pm2_5', 'pm10', 'no2', 'so2', 'co', 'o3']:
             logger.info(f"  {feature}: {metrics[f'{feature}_rmse']:.4f}")
 
-        # 画图
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_path = os.path.join(
-            config.file.figures_dir,
-            f'backtest_{args.model}_{timestamp}.png',
-        )
-        plot_backtest_results(
+        # 画图：每个指标独立图表，保存到 outputs/figures/<model_type>/
+        # y_true_raw 是原始未裁剪的真值，让 y 轴反映真实数据范围
+        out_dir = plot_backtest_results(
             y_true=result['y_true'],
             y_pred=result['y_pred'],
             dates=result['dates'],
-            save_path=save_path,
+            model_type=args.model,
+            y_true_raw=y_true_raw,
         )
-        logger.info(f"图表已保存到: {save_path}")
+        logger.info(f"图表已保存到: {out_dir}/")
         return 0
     except Exception as e:
         logger.error(f"回测失败: {str(e)}", exc_info=True)

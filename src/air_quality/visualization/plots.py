@@ -4,6 +4,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
+import matplotlib.dates as mdates
 matplotlib.use('Agg')  # 非交互式后端
 import os
 from typing import List
@@ -41,20 +42,16 @@ def plot_training_history(history: dict, save_path: str = None, show: bool = Fal
     if 'best_loss' in history and history['best_loss'] != float('inf'):
         axes[0].set_title(f'Training History - Loss (Best: {history["best_loss"]:.4f})')
 
-    # 指标雷达图（如果有）
-    if 'metrics' in history and len(history['metrics']) > 0:
-        latest_metrics = history['metrics'][-1]
-        metric_names = ['mse', 'rmse', 'mae', 'r2']
-        metric_values = [latest_metrics.get(f'overall_{m}', 0) for m in metric_names]
-
-        # 归一化显示
-        max_val = max(metric_values) if max(metric_values) > 0 else 1
-        normalized_values = [v / max_val for v in metric_values]
-
-        axes[1].bar(metric_names, normalized_values, color='steelblue', alpha=0.7)
-        axes[1].set_ylabel('Normalized Value')
-        axes[1].set_title('Latest Metrics (Normalized)')
+    # 学习率曲线
+    if 'lr' in history and len(history['lr']) > 0:
+        lr_values = history['lr']
+        lr_epochs = range(1, len(lr_values) + 1)
+        axes[1].plot(lr_epochs, lr_values, color='green', linewidth=1.5)
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Learning Rate')
+        axes[1].set_title('Learning Rate Schedule')
         axes[1].grid(True, alpha=0.3)
+        axes[1].ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
 
     plt.tight_layout()
 
@@ -70,9 +67,7 @@ def plot_training_history(history: dict, save_path: str = None, show: bool = Fal
     return save_path
 
 
-def plot_prediction_comparison(y_true: np.ndarray, y_pred: np.ndarray,
-                              dates: List[str] = None, feature_names: List[str] = None,
-                              save_path: str = None, show: bool = False):
+def plot_prediction_comparison(y_true: np.ndarray, y_pred: np.ndarray,dates: List[str] = None, feature_names: List[str] = None,save_path: str = None, show: bool = False):
     """绘制预测值与真实值对比图"""
     feature_names = feature_names or ['AQI', 'PM2.5', 'PM10', 'NO2', 'SO2', 'CO', 'O3', 'Month', 'Season']
     n_features = min(y_true.shape[-1], len(feature_names))
@@ -215,61 +210,86 @@ def plot_metrics(metrics: dict, save_path: str = None, show: bool = False):
 
 def plot_backtest_results(y_true: np.ndarray, y_pred: np.ndarray,
                           dates: list = None, feature_names: list = None,
-                          save_path: str = None, show: bool = False) -> str:
-    """绘制回测结果：7 个子图，每个污染物一张真值 vs 预测对比图。
+                          save_path: str = None, show: bool = False,
+                          model_type: str = None,
+                          y_true_raw: np.ndarray = None) -> str:
+    """绘制回测结果：每个污染物生成一张独立图表，保存到模型专属文件夹。
 
     Args:
-        y_true: shape (N, prediction_days, 7)
+        y_true: shape (N, prediction_days, 7) —— 经过预处理裁剪/缩放的真值
         y_pred: shape (N, prediction_days, 7)
         dates: list of length N，每个元素是 prediction_days 个日期字符串
         feature_names: 列名（默认 7 个污染物）
-        save_path: 图片保存路径
+        save_path: 保存目录（若为 None 则使用 outputs/figures/<model_type>/）
         show: 是否 plt.show()
+        model_type: 模型名称，用于子文件夹命名
+        y_true_raw: shape (N, prediction_days, 7) —— 原始未裁剪的真值（可选）。
+                    若提供，则作为"真实值"曲线绘制，确保 y 轴反映数据的真实范围。
+                    若为 None，则回退到 y_true（可能已被 _handle_outliers 裁剪）。
+
+    Returns:
+        保存目录路径
     """
     feature_names = feature_names or ['AQI', 'PM2.5', 'PM10', 'NO2', 'SO2', 'CO', 'O3']
     n_features = min(y_true.shape[-1], len(feature_names))
 
-    true_flat = y_true[..., :n_features].reshape(-1, n_features)
+    # 优先使用原始未裁剪的真值，让 y 轴反映真实数据范围（不被 _handle_outliers 强行截断）
+    if y_true_raw is not None:
+        true_flat = y_true_raw[..., :n_features].reshape(-1, n_features)
+    else:
+        true_flat = y_true[..., :n_features].reshape(-1, n_features)
     pred_flat = y_pred[..., :n_features].reshape(-1, n_features)
 
+    # 解析日期
+    use_dates = False
+    x_dates = None
     if dates is not None:
+        import pandas as pd
         flat_dates = []
         for window_dates in dates:
             flat_dates.extend(window_dates)
-        x_vals = flat_dates
-        use_strings = True
-    else:
-        x_vals = list(range(len(true_flat)))
-        use_strings = False
+        x_dates = pd.to_datetime(flat_dates)
+        use_dates = True
 
-    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
-    axes = axes.flatten()
+    # 确定保存目录
+    if save_path is not None:
+        out_dir = save_path if os.path.isdir(save_path) else os.path.dirname(save_path)
+    else:
+        out_dir = os.path.join('outputs', 'figures', model_type or 'default')
+    os.makedirs(out_dir, exist_ok=True)
 
     for i in range(n_features):
-        ax = axes[i]
-        ax.plot(x_vals, true_flat[:, i], label='True', alpha=0.7, linewidth=1.0)
-        ax.plot(x_vals, pred_flat[:, i], label='Predicted', alpha=0.7, linewidth=1.0, linestyle='--')
-        ax.set_title(feature_names[i])
-        ax.set_xlabel('Date' if use_strings else 'Time Step')
+        fig, ax = plt.subplots(figsize=(16, 6), facecolor='white')
+        ax.set_facecolor('white')
+
+        if use_dates:
+            ax.plot(x_dates, true_flat[:, i], label='真实值', alpha=0.8, linewidth=1.2)
+            ax.plot(x_dates, pred_flat[:, i], label='预测值', alpha=0.8, linewidth=1.2, linestyle='--')
+            ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            fig.autofmt_xdate(rotation=30, ha='right')
+            ax.set_xlabel('日期')
+        else:
+            x_vals = np.arange(len(true_flat))
+            ax.plot(x_vals, true_flat[:, i], label='真实值', alpha=0.8, linewidth=1.2)
+            ax.plot(x_vals, pred_flat[:, i], label='预测值', alpha=0.8, linewidth=1.2, linestyle='--')
+            ax.set_xlabel('时间步')
+
         ax.set_ylabel(feature_names[i])
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(True, alpha=0.3)
-        if use_strings:
-            ax.tick_params(axis='x', rotation=45, labelsize=6)
+        ax.set_title(feature_names[i], fontsize=14, fontweight='bold')
+        ax.legend(loc='upper right', fontsize=10)
+        ax.grid(True, alpha=0.2, color='gray')
 
-    for i in range(n_features, len(axes)):
-        axes[i].set_visible(False)
+        # 去掉灰色边框
+        for spine in ax.spines.values():
+            spine.set_color('#cccccc')
 
-    plt.suptitle('Backtest: Predicted vs True (all dates)', fontsize=14, fontweight='bold')
-    plt.tight_layout()
+        plt.tight_layout()
 
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig_path = os.path.join(out_dir, f'{feature_names[i].replace(".", "_")}.png')
+        plt.savefig(fig_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
-    elif show:
-        plt.show()
-    else:
-        plt.close()
+        if show:
+            fig.show()
 
-    return save_path
+    return out_dir

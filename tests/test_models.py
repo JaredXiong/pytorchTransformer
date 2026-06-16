@@ -9,10 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from air_quality.models import create_model
 
-SKIP_TYPES = {'tcn'}  # TCN has a pre-existing residual bug, skip here
-
-MODEL_TYPES = ['transformer', 'lstm', 'gru', 'cnn', 'hybrid']
-
+MODEL_TYPES = ['transformer', 'lstm', 'cnn', 'hybrid']
 
 class TestModelOutputShape(unittest.TestCase):
     def setUp(self):
