@@ -36,9 +36,7 @@ htmlcov/
 .ipynb_checkpoints/
 
 # Project artifacts (training output)
-outputs/checkpoints/*.pth
-outputs/checkpoints/*.pkl
-outputs/figures/*.png
+outputs/checkpoints/
 
 # Raw data (kept locally; large files often go in DVC / external storage)
 # Uncomment the next line if the dataset should not be committed:
@@ -46,3 +44,6 @@ outputs/figures/*.png
 
 # Logs
 *.log
+
+/.claude/
+CLAUDE.md
