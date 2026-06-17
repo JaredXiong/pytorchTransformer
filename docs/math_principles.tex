@@ -3,40 +3,17 @@
 %  pytorchTransformer  ——  算法数学原理
 %  项目：基于 14 天输入（9 维特征）的空气质量多污染物 3 日预测系统
 %  内容：数据预处理、位置编码、Transformer / LSTM / CNN / Hybrid / Ensemble 五种模型、
+%        VMD 变分模态分解、VMD-CNN-BiLSTM-Attention 混合模型、
+%        半监督学习（伪标签法）、无监督预训练-有监督微调范式、
 %        训练优化（Adam + OneCycleLR + 梯度裁剪 + 早停）、
 %        损失函数（MSE / Huber / Anti-Smoothing 复合损失）、
 %        评估指标（RMSE / MAE / R² / 反平滑检测）、
 %        自回归推理与软饱和。
-%
-%  ★★★ 编译前必读（尤其在 Overleaf 上） ★★★
-%  -----------------------------------------------------------------
-%  1) 引擎必须选择 XeLaTeX（不是 pdfLaTeX）！
-%     Overleaf 设置：左上角 Menu → Compiler → "XeLaTeX"
-%     命令行：       xelatex math_principles.tex
-%                    xelatex math_principles.tex   # 第二次生成目录
-%
-%  2) 字体集使用 fandol（TeX Live 自带，无需额外安装）。
-%     若你使用本地 TeX Live 2025+ 但 fandol 缺失，运行
-%     `tlmgr install fandol` 安装；Overleaf 已自带。
-%
-%  3) 如果你仍坚持使用 pdfLaTeX：
-%     - 必须把 \usepackage[UTF8,fontset=fandol]{ctex} 注释掉；
-%     - 改用 \usepackage{CJKutf8}；
-%     - 正文外用 \begin{CJK}{UTF8}{gbsn} ... \end{CJK} 包裹中文。
-%     但这会损失 ctex 自带的标题/目录中文格式化效果，不推荐。
-%
-%  4) 历史上报错的可能原因：
-%     - "CTeX fontset 'fandol' unavailable"   → 用了 pdfLaTeX；切到 XeLaTeX
-%     - "fontspec requires XeTeX/LuaTeX"       → 同上
-%     - "font unihei9e not found"              → pdfLaTeX 找不到中文字体
-%     - "\Attention undefined" 等              → 已修复（见下方 \DeclareMathOperator）
 % =============================================================================
 
 \documentclass[11pt,a4paper]{article}
 
 % ---------- 字体与中文支持 ----------
-% ctex 宏包在 XeLaTeX 下会自动加载 fontspec，不需要单独再写 \usepackage{fontspec}
-% 若使用 pdfLaTeX，请注释掉下面这一行并改用 CJKutf8 之类的替代方案（不推荐）
 \usepackage[UTF8,fontset=fandol]{ctex}  % 中文支持；fandol 字体随 TeX Live 自带，仅需 XeLaTeX
 \usepackage{amsmath,amssymb,amsfonts}  % 数学公式
 \usepackage{bm}                       % 加粗数学符号
@@ -65,7 +42,6 @@
 \DeclareMathOperator{\BN}{BN}
 \DeclareMathOperator{\ReLU}{ReLU}
 \DeclareMathOperator{\GeLU}{GeLU}
-% ---- 新增：原文中已使用但未声明的算子 ----
 \DeclareMathOperator{\Attention}{Attention}
 \DeclareMathOperator{\MaxPool}{MaxPool}
 \DeclareMathOperator{\Conv1d}{Conv1d}
@@ -337,6 +313,396 @@ $\sigma(0.3) \approx 0.574$。
 \]
 
 % =============================================================================
+\section{变分模态分解（VMD）}
+% =============================================================================
+
+\subsection{分解目标}
+变分模态分解（Variational Mode Decomposition, VMD）将一维信号 $x(t)$ 分解为 $K$ 个
+本征模态函数（Intrinsic Mode Functions, IMF）$\{u_k(t)\}_{k=1}^{K}$，每个模态具有
+有限带宽且围绕中心频率 $\omega_k$。VMD 将分解问题建模为约束变分优化：
+\begin{equation}\label{eq:vmd_obj}
+\min_{\{u_k\},\{\omega_k\}} \sum_{k=1}^{K} \left\| \partial_t \left[ \left(\delta(t) + \frac{j}{\pi t}\right) * u_k(t) \right] e^{-j\omega_k t} \right\|_2^2,
+\end{equation}
+\[
+\text{s.t.} \quad \sum_{k=1}^{K} u_k(t) = x(t).
+\]
+
+\subsection{增广拉格朗日方法}
+引入二次惩罚项与拉格朗日乘子 $\lambda(t)$，构造增广拉格朗日函数：
+\begin{equation}
+\mathcal{L}(\{u_k\},\{\omega_k\},\lambda) = \sum_{k=1}^{K} \left\| \partial_t \left[ \left(\delta(t) + \frac{j}{\pi t}\right) * u_k(t) \right] e^{-j\omega_k t} \right\|_2^2
++ \alpha \left\| x(t) - \sum_{k=1}^{K} u_k(t) \right\|_2^2
++ \left\langle \lambda(t),\, x(t) - \sum_{k=1}^{K} u_k(t) \right\rangle,
+\end{equation}
+其中 $\alpha > 0$ 为带宽约束参数（本项目取 $\alpha = 2000$），值越大则各模态带宽越窄。
+
+\subsection{交替方向乘子法（ADMM）求解}
+VMD 采用交替方向乘子法（ADMM）迭代求解，每轮迭代包含三个子步骤：
+
+\paragraph{步骤 1：更新模态 $u_k$。}
+在频域中求解，对 $\hat{u}_k(\omega)$ 的更新为：
+\begin{equation}
+\hat{u}_k^{n+1}(\omega) = \frac{\hat{x}(\omega) - \sum_{i \neq k} \hat{u}_i^{n}(\omega) + \frac{\hat{\lambda}^n(\omega)}{2}}{1 + \alpha(\omega - \omega_k^n)^2},
+\end{equation}
+其中 $\hat{x}, \hat{u}_k, \hat{\lambda}$ 分别为 $x, u_k, \lambda$ 的傅里叶变换。
+
+\paragraph{步骤 2：更新中心频率 $\omega_k$。}
+中心频率通过模态功率谱的重心估计：
+\begin{equation}
+\omega_k^{n+1} = \frac{\int_0^{\infty} \omega |\hat{u}_k^{n+1}(\omega)|^2 \, d\omega}{\int_0^{\infty} |\hat{u}_k^{n+1}(\omega)|^2 \, d\omega}.
+\end{equation}
+
+\paragraph{步骤 3：更新拉格朗日乘子 $\lambda$。}
+\begin{equation}
+\hat{\lambda}^{n+1}(\omega) = \hat{\lambda}^n(\omega) + \tau \left( \hat{x}(\omega) - \sum_{k=1}^{K} \hat{u}_k^{n+1}(\omega) \right),
+\end{equation}
+其中 $\tau > 0$ 为噪声容忍参数（本项目取 $\tau = 0$）。
+
+\subsection{收敛准则}
+当相邻迭代的模态变化量低于容差 $\epsilon$ 时停止：
+\begin{equation}
+\sum_{k=1}^{K} \frac{\|\hat{u}_k^{n+1} - \hat{u}_k^n\|_2^2}{\|\hat{u}_k^n\|_2^2} < \epsilon, \quad \epsilon = 10^{-7}.
+\end{equation}
+
+\subsection{本项目的 VMD 配置}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{分解对象}：仅对 AQI 单变量序列 $x(t) = \text{AQI}(t)$ 进行分解；
+  \item \textbf{模态数}：$K = 4$（可在配置中调整为 4/6/8）；
+  \item \textbf{带宽约束}：$\alpha = 2000$；
+  \item \textbf{噪声容忍}：$\tau = 0$（不允许重构误差）；
+  \item \textbf{DC 分量}：$\text{DC} = 0$（不保留直流分量）；
+  \item \textbf{初始化}：$\text{init} = 1$（均匀分布初始化中心频率）。
+\end{itemize}
+
+分解后，原始 AQI 序列被替换为 $K$ 个 IMF 分量，输入维度从 $d_{\text{in}} = 9$ 变为 $d_{\text{in}}' = 8 + K$：
+\[
+\mat{X}_{\text{vmd}} = \bigl[\,\text{IMF}_1, \dots, \text{IMF}_K,\, \text{PM}_{2.5},\, \text{PM}_{10},\, \text{NO}_2,\, \text{SO}_2,\, \text{CO},\, \text{O}_3,\, \text{month},\, \text{season}\,\bigr] \in \R^{T_{\text{in}} \times (8+K)}.
+\]
+
+% =============================================================================
+\section{VMD-CNN-BiLSTM-Attention 模型}
+% =============================================================================
+
+\subsection{模型架构}
+VMD-CNN-BiLSTM-Attention 是一种专为空气质量预测设计的混合架构，
+将变分模态分解（VMD）、多尺度卷积神经网络（CNN）、双向长短期记忆网络（BiLSTM）
+和时间步注意力机制（Attention）有机结合。该架构的核心思想是：
+\begin{enumerate}[leftmargin=*]
+  \item VMD 将 AQI 分解为多个平稳的 IMF 分量，降低序列的非平稳性；
+  \item 多尺度 CNN 提取不同时间尺度的局部空间特征；
+  \item BiLSTM 捕获前后文双向时序依赖关系；
+  \item Attention 机制自动聚焦对预测贡献最大的历史时刻。
+\end{enumerate}
+
+\subsection{双头设计（Dual-Head）}
+为支持预训练-微调范式，模型采用双头设计：
+\begin{itemize}[leftmargin=*]
+  \item \textbf{共享 Backbone}：$\text{input\_proj} + \text{多尺度 CNN} + \text{BiLSTM} + \text{Attention}$；
+  \item \textbf{预训练头}（$\text{pretrain\_head}$）：$\text{Linear}(2H_{\text{bilstm}}, K)$，预测被遮盖的 IMF 分量；
+  \item \textbf{微调头}（$\text{finetune\_head}$）：$\text{Linear}(2H_{\text{bilstm}}, H_{\text{fc}}) \to \text{ReLU} \to \text{Dropout} \to \text{Linear}(H_{\text{fc}}, 7)$，预测 7 维污染物浓度。
+\end{itemize}
+
+前向传播根据模式参数 $\text{mode} \in \{\texttt{pretrain}, \texttt{finetune}\}$ 选择不同的输出头：
+\begin{equation}
+f_{\theta}(\mat{X}, \text{mode}) =
+\begin{cases}
+\text{pretrain\_head}\bigl(\text{Backbone}(\mat{X})\bigr) \in \R^{T_{\text{in}} \times K}, & \text{mode} = \texttt{pretrain}, \\
+\text{finetune\_head}\bigl(\text{Backbone}(\mat{X})\bigr) \in \R^{T_{\text{in}} \times 7}, & \text{mode} = \texttt{finetune}.
+\end{cases}
+\end{equation}
+默认 $\text{mode} = \texttt{finetune}$，保证与现有调用方完全兼容。
+
+\subsection{共享 Backbone 详细设计}
+
+\paragraph{输入投影。}
+\[
+\mat{E} = \mat{W}_{\text{in}} \mat{X}_{\text{vmd}} + \vect{b}_{\text{in}} \in \R^{T_{\text{in}} \times F_{\text{cnn}}},
+\]
+其中 $F_{\text{cnn}} = 64$ 为 CNN 卷积核数量。
+
+\paragraph{多尺度卷积。}
+对 $\mat{E}^{\top} \in \R^{F_{\text{cnn}} \times T_{\text{in}}}$，使用三个不同核大小的卷积核提取局部特征：
+\begin{align}
+\mat{Z}_3 &= \ReLU\bigl(\BN(\Conv1d_{k=3}(\mat{E}^{\top}))\bigr) \in \R^{F_{\text{cnn}} \times T_{\text{in}}}, \\
+\mat{Z}_5 &= \ReLU\bigl(\BN(\Conv1d_{k=5}(\mat{E}^{\top}))\bigr) \in \R^{F_{\text{cnn}} \times T_{\text{in}}}, \\
+\mat{Z}_7 &= \ReLU\bigl(\BN(\Conv1d_{k=7}(\mat{E}^{\top}))\bigr) \in \R^{F_{\text{cnn}} \times T_{\text{in}}}.
+\end{align}
+沿通道维拼接：
+\[
+\mat{Z}_{\text{cat}} = [\mat{Z}_3 \Vert \mat{Z}_5 \Vert \mat{Z}_7] \in \R^{3F_{\text{cnn}} \times T_{\text{in}}}.
+\]
+经 BatchNorm 和自适应最大池化保持时序长度后转置：
+\[
+\mat{Z}_{\text{pool}} = \text{AdaptiveMaxPool1d}\bigl(\ReLU(\BN(\mat{Z}_{\text{cat}})),\, T_{\text{in}}\bigr) \in \R^{3F_{\text{cnn}} \times T_{\text{in}}},
+\quad \mat{H}_{\text{cnn}} = \mat{Z}_{\text{pool}}^{\top} \in \R^{T_{\text{in}} \times 3F_{\text{cnn}}}.
+\]
+
+\paragraph{双向 LSTM。}
+设 BiLSTM 隐藏层维度为 $H_{\text{bilstm}} = 128$，层数 $L_{\text{bilstm}} = 2$：
+\begin{align}
+\overrightarrow{\mat{H}} &= \text{LSTM}_{\text{forward}}(\mat{H}_{\text{cnn}}) \in \R^{T_{\text{in}} \times H_{\text{bilstm}}}, \\
+\overleftarrow{\mat{H}} &= \text{LSTM}_{\text{backward}}(\mat{H}_{\text{cnn}}) \in \R^{T_{\text{in}} \times H_{\text{bilstm}}}, \\
+\mat{H}_{\text{bilstm}} &= [\overrightarrow{\mat{H}} \Vert \overleftarrow{\mat{H}}] \in \R^{T_{\text{in}} \times 2H_{\text{bilstm}}}.
+\end{align}
+
+\paragraph{时间步注意力。}
+对 $\mat{H}_{\text{bilstm}}$ 的每个时间步计算注意力权重：
+\begin{align}
+\mat{S} &= \vect{v}^{\top} \tanh\!\bigl(\mat{W}_a \mat{H}_{\text{bilstm}}\bigr) \in \R^{T_{\text{in}}}, \\
+\mat{\alpha} &= \softmax(\mat{S}) \in \R^{T_{\text{in}}}, \\
+\mat{H}_{\text{attn}} &= \mat{H}_{\text{bilstm}} \odot \mat{\alpha}^{\top} \in \R^{T_{\text{in}} \times 2H_{\text{bilstm}}},
+\end{align}
+其中 $\mat{W}_a \in \R^{2H_{\text{bilstm}} \times 2H_{\text{bilstm}}}$，$\vect{v} \in \R^{2H_{\text{bilstm}}}$ 为可学习参数。
+注意力机制自动为对预测贡献更大的时间步赋予更高权重。
+
+\subsection{超参数默认值}
+\begin{table}[ht]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+模块 & 参数 & 默认值 \\ \midrule
+VMD & $K$（模态数） & 4 \\
+    & $\alpha$（带宽约束） & 2000 \\
+    & $\tau$（噪声容忍） & 0 \\
+    & $\epsilon$（收敛容差） & $10^{-7}$ \\ \midrule
+CNN & $F_{\text{cnn}}$（卷积核数量） & 64 \\
+    & 核大小 & 3, 5, 7 \\ \midrule
+BiLSTM & $H_{\text{bilstm}}$（隐藏层维度） & 128 \\
+       & $L_{\text{bilstm}}$（层数） & 2 \\
+       & dropout & 0.1 \\ \midrule
+Attention & $\mat{W}_a$ 维度 & $2H_{\text{bilstm}} \times 2H_{\text{bilstm}}$ \\ \midrule
+微调头 & 隐藏层维度 & $H_{\text{bilstm}} = 128$ \\
+       & 输出维度 & 7（污染物） \\ \midrule
+预训练头 & 输出维度 & $K = 4$（IMF 分量） \\
+\bottomrule
+\end{tabular}
+\caption{VMD-CNN-BiLSTM-Attention 模型超参数默认值。}
+\end{table}
+
+% =============================================================================
+\section{半监督学习（伪标签法）}
+% =============================================================================
+
+\subsection{数据划分}
+设总样本数为 $N$，按时间顺序划分为三段（避免未来信息泄露）：
+\[
+N_{\text{lab}} = \lfloor \rho_l N \rfloor,\quad N_{\text{unlab}} = \lfloor \rho_u N \rfloor,\quad N_{\text{test}} = N - N_{\text{lab}} - N_{\text{unlab}},
+\]
+其中 $\rho_l = 0.4$，$\rho_u = 0.4$，$\rho_{\text{test}} = 0.2$。划分后：
+\begin{itemize}[leftmargin=*]
+  \item \textbf{有标签集} $\mathcal{D}_{\text{lab}} = \{(\mat{X}_i, \mat{Y}_i)\}_{i=1}^{N_{\text{lab}}}$，用于 Teacher 训练；
+  \item \textbf{无标签集} $\mathcal{D}_{\text{unlab}} = \{\mat{X}_i\}_{i=N_{\text{lab}}+1}^{N_{\text{lab}}+N_{\text{unlab}}}$，仅提供输入序列；
+  \item \textbf{测试集} $\mathcal{D}_{\text{test}} = \{(\mat{X}_i, \mat{Y}_i)\}_{i=N_{\text{lab}}+N_{\text{unlab}}+1}^{N}$，用于最终评估。
+\end{itemize}
+
+\subsection{四阶段伪标签训练}
+
+\paragraph{阶段 1：Teacher 预训练。}
+在有标签集 $\mathcal{D}_{\text{lab}}$ 上训练 Teacher 模型 $f_{\theta_T}$，使用标准监督损失：
+\[
+\theta_T^* = \arg\min_{\theta_T} \frac{1}{N_{\text{lab}}} \sum_{(\mat{X}, \mat{Y}) \in \mathcal{D}_{\text{lab}}} \mathcal{L}\bigl(f_{\theta_T}(\mat{X})[-T_{\text{out}}:,\, :],\, \mat{Y}\bigr),
+\]
+其中 $\mathcal{L}$ 为 Huber 损失。
+
+\paragraph{阶段 2：伪标签生成。}
+用训练好的 Teacher 对无标签集进行推理，生成伪标签：
+\[
+\widehat{\mat{Y}}_i = f_{\theta_T^*}(\mat{X}_i)[-T_{\text{out}}:,\, :], \quad i \in \mathcal{D}_{\text{unlab}}.
+\]
+
+\paragraph{置信度计算。}
+对每个样本的伪标签计算置信度分数，衡量预测的稳定性：
+\begin{equation}\label{eq:confidence}
+c_i = \frac{1}{1 + \mathrm{std}(\widehat{\mat{Y}}_i)},
+\end{equation}
+其中 $\mathrm{std}(\widehat{\mat{Y}}_i)$ 为伪标签在时间步和特征维度上的标准差。
+低方差（预测稳定）对应高置信度，高方差（预测波动大）对应低置信度。
+
+\paragraph{阈值过滤。}
+仅保留置信度超过阈值 $\tau_c$ 的样本作为高质量伪标签：
+\[
+\mathcal{M} = \{i : c_i \ge \tau_c\}, \quad \tau_c = 0.85.
+\]
+若过滤后集合为空（所有样本置信度均低于阈值），则保留置信度最高的前 10\% 样本，
+防止训练集为空导致的训练失败。
+
+\paragraph{阶段 3：Student 联合训练。}
+将有标签集与高置信度伪标签集合并，训练 Student 模型 $f_{\theta_S}$：
+\[
+\mathcal{D}_{\text{combined}} = \mathcal{D}_{\text{lab}} \cup \{(\mat{X}_i, \widehat{\mat{Y}}_i) : i \in \mathcal{M}\},
+\]
+\[
+\theta_S^* = \arg\min_{\theta_S} \frac{1}{|\mathcal{D}_{\text{combined}}|} \sum_{(\mat{X}, \mat{Y}) \in \mathcal{D}_{\text{combined}}} \mathcal{L}\bigl(f_{\theta_S}(\mat{X})[-T_{\text{out}}:,\, :],\, \mat{Y}\bigr).
+\]
+
+\paragraph{阶段 4：测试集评估。}
+在测试集上评估 Student 模型的最终性能：
+\[
+\widehat{\mat{Y}}_{\text{test}} = f_{\theta_S^*}(\mat{X}_{\text{test}})[-T_{\text{out}}:,\, :].
+\]
+计算 MSE / RMSE / MAE / R² 等指标。
+
+\subsection{算法流程}
+\begin{algorithm}[ht]
+\caption{伪标签半监督训练流程}
+\begin{algorithmic}[1]
+\REQUIRE 有标签集 $\mathcal{D}_{\text{lab}}$，无标签集 $\mathcal{D}_{\text{unlab}}$，置信度阈值 $\tau_c$
+\ENSURE 训练好的 Student 模型 $f_{\theta_S^*}$
+\STATE \textbf{阶段 1：} 在 $\mathcal{D}_{\text{lab}}$ 上训练 Teacher $f_{\theta_T^*}$
+\FOR{每个样本 $\mat{X}_i \in \mathcal{D}_{\text{unlab}}$}
+  \STATE $\widehat{\mat{Y}}_i \gets f_{\theta_T^*}(\mat{X}_i)[-T_{\text{out}}:,\, :]$
+  \STATE $c_i \gets 1 / (1 + \mathrm{std}(\widehat{\mat{Y}}_i))$
+\ENDFOR
+\STATE $\mathcal{M} \gets \{i : c_i \ge \tau_c\}$
+\IF{$\mathcal{M} = \emptyset$}
+  \STATE $\mathcal{M} \gets$ 置信度最高的前 10\% 样本
+\ENDIF
+\STATE $\mathcal{D}_{\text{combined}} \gets \mathcal{D}_{\text{lab}} \cup \{(\mat{X}_i, \widehat{\mat{Y}}_i) : i \in \mathcal{M}\}$
+\STATE \textbf{阶段 3：} 在 $\mathcal{D}_{\text{combined}}$ 上训练 Student $f_{\theta_S^*}$
+\STATE \textbf{阶段 4：} 在 $\mathcal{D}_{\text{test}}$ 上评估 $f_{\theta_S^*}$
+\end{algorithmic}
+\end{algorithm}
+
+% =============================================================================
+\section{无监督预训练-有监督微调范式}
+% =============================================================================
+
+\subsection{动机}
+在标注数据稀缺的场景下（如仅有 40\% 的数据有标签），直接训练模型可能导致
+泛化能力不足。无监督预训练-有监督微调范式通过两个阶段充分利用数据：
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{预训练阶段}：在无标签数据上通过掩码自监督学习，让模型的共享 Backbone
+        提前学到"通过上下文推断 IMF 分量"的能力；
+  \item \textbf{微调阶段}：用预训练权重初始化 Teacher 和 Student，再进行有监督训练。
+\end{enumerate}
+
+\subsection{掩码自监督预训练}
+
+\paragraph{掩码生成。}
+对输入序列 $\mat{X} \in \R^{T_{\text{in}} \times (8+K)}$，生成二值掩码 $\mat{M} \in \{0, 1\}^{T_{\text{in}} \times K}$，
+其中 $K$ 为 VMD 模态数。掩码以概率 $p_{\text{mask}}$ 随机置零（本项目取 $p_{\text{mask}} = 0.3$）：
+\begin{equation}\label{eq:mask}
+M_{t,k} \sim \text{Bernoulli}(1 - p_{\text{mask}}), \quad t = 1,\dots,T_{\text{in}},\; k = 1,\dots,K.
+\end{equation}
+为防止某样本所有位置均被遮盖导致损失为零，对每个样本 $i$ 检查：
+\[
+\text{if } \sum_{t,k} M_{t,k}^{(i)} = 0, \text{ then set } M_{1,1}^{(i)} = 1.
+\]
+
+\paragraph{掩码输入构造。}
+将被遮盖位置的 IMF 值置零，构造掩码输入：
+\begin{equation}
+\widetilde{\mat{X}}_{t,k} = \mat{X}_{t,k} \cdot M_{t,k}, \quad k = 1,\dots,K,
+\end{equation}
+\[
+\widetilde{\mat{X}}_{t,j} = \mat{X}_{t,j}, \quad j = K+1,\dots,8+K \;\;(\text{其他特征保持不变}).
+\]
+
+\paragraph{预训练目标。}
+模型以 $\text{mode} = \texttt{pretrain}$ 前向传播，输出 IMF 预测：
+\[
+\widehat{\mat{U}} = f_{\theta}(\widetilde{\mat{X}}, \texttt{pretrain}) \in \R^{T_{\text{in}} \times K}.
+\]
+预训练损失仅在被遮盖位置计算（掩码 MSE）：
+\begin{equation}\label{eq:pretrain_loss}
+\mathcal{L}_{\text{pretrain}} = \frac{\sum_{i,t,k} M_{t,k}^{(i)} \bigl(\widehat{U}_{t,k}^{(i)} - X_{t,k}^{(i)}\bigr)^2}{\sum_{i,t,k} M_{t,k}^{(i)} + \epsilon},
+\end{equation}
+其中 $\epsilon = 10^{-6}$ 为数值稳定性常数。
+
+\paragraph{优化。}
+使用 Adam 优化器，学习率 $\eta_{\text{pre}} = 5 \times 10^{-4}$（高于微调阶段），
+权重衰减 $\lambda_{\text{pre}} = 3 \times 10^{-4}$，梯度裁剪阈值 $c = 1.0$。
+当连续 $P_{\text{pre}} = 20$ 个 epoch 验证损失不下降时早停。
+
+\subsection{预训练-微调编排}
+
+\paragraph{Phase 0：预训练。}
+仅在无标签集 $\mathcal{D}_{\text{unlab}}$ 上执行掩码自监督预训练：
+\[
+\theta_{\text{pre}}^* = \arg\min_{\theta} \mathcal{L}_{\text{pretrain}}(\theta; \mathcal{D}_{\text{unlab}}).
+\]
+预训练完成后，提取 Backbone 权重：
+\[
+\theta_{\text{backbone}} = \{\theta_k : k \in \text{Backbone keys}\} \subset \theta_{\text{pre}}^*.
+\]
+其中 Backbone keys 包括 $\{\texttt{input\_proj}, \texttt{conv3}, \texttt{conv5}, \texttt{conv7}, \texttt{bn}, \texttt{bilstm}, \texttt{attention}\}$，
+不包括 $\texttt{pretrain\_head}$ 和 $\texttt{finetune\_head}$。
+
+\paragraph{Phase 1-3：半监督微调。}
+用预训练 Backbone 权重初始化 Teacher 和 Student：
+\[
+\theta_T \leftarrow \theta_{\text{backbone}} \cup \theta_{\text{head}}^{\text{random}}, \quad
+\theta_S \leftarrow \theta_{\text{backbone}} \cup \theta_{\text{head}}^{\text{random}},
+\]
+其中 $\theta_{\text{head}}^{\text{random}}$ 为随机初始化的微调头权重。
+Teacher 和 Student 共享相同的 Backbone 起点，但微调头独立随机初始化。
+
+随后执行与第 11 节相同的伪标签半监督训练流程（阶段 1-4）。
+
+\paragraph{Phase 4：测试集评估。}
+在测试集上评估 Student 模型的最终性能。
+
+\subsection{算法流程}
+\begin{algorithm}[ht]
+\caption{预训练-微调半监督训练流程}
+\begin{algorithmic}[1]
+\REQUIRE 有标签集 $\mathcal{D}_{\text{lab}}$，无标签集 $\mathcal{D}_{\text{unlab}}$，预训练轮数 $E_{\text{pre}}$，掩码比例 $p_{\text{mask}}$
+\ENSURE 训练好的 Student 模型 $f_{\theta_S^*}$
+\STATE \textbf{Phase 0：预训练}
+\STATE 初始化模型 $f_{\theta}$（双头：pretrain\_head + finetune\_head）
+\FOR{epoch $= 1, \dots, E_{\text{pre}}$}
+  \FOR{每个 batch $\mat{X}^{(b)} \in \mathcal{D}_{\text{unlab}}$}
+    \STATE 生成掩码 $\mat{M}^{(b)} \sim \text{Bernoulli}(1 - p_{\text{mask}})$
+    \STATE 构造掩码输入 $\widetilde{\mat{X}}^{(b)} = \mat{X}^{(b)} \odot \mat{M}^{(b)}$
+    \STATE $\widehat{\mat{U}}^{(b)} \gets f_{\theta}(\widetilde{\mat{X}}^{(b)}, \texttt{pretrain})$
+    \STATE 计算 $\mathcal{L}_{\text{pretrain}}$（仅在 $M_{t,k} = 0$ 的位置）
+    \STATE Adam 更新 $\theta$
+  \ENDFOR
+  \IF{早停条件满足}
+    \STATE \textbf{break}
+  \ENDIF
+\ENDFOR
+\STATE 提取 Backbone 权重 $\theta_{\text{backbone}}$
+\STATE \textbf{Phase 1-3：半监督微调}
+\STATE 用 $\theta_{\text{backbone}}$ 初始化 Teacher 和 Student
+\STATE 执行伪标签半监督训练（算法 1）
+\STATE \textbf{Phase 4：} 在 $\mathcal{D}_{\text{test}}$ 上评估
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{范式合理性分析}
+
+\paragraph{与数据规模的匹配。}
+北京 2015-2024 数据集包含约 3652 天的观测数据，构造约 3639 个序列样本。
+在 40/40/20 划分下，有标签集约 1455 个序列，无标签集约 1455 个序列，
+测试集约 729 个序列。这一规模足以支撑半监督训练。
+
+\paragraph{与模型架构的契合。}
+\begin{itemize}[leftmargin=*]
+  \item VMD 将 AQI 分解为趋势/周期/随机分量，符合空气污染多尺度耦合机理；
+  \item CNN 提取 IMF 局部空间模式；
+  \item BiLSTM 捕获前后文双向时序依赖；
+  \item Attention 突出关键时间步（如污染爆发前兆）。
+\end{itemize}
+
+\paragraph{预训练任务的合理性。}
+掩码 IMF 预测任务要求模型：
+\begin{enumerate}[leftmargin=*]
+  \item 理解未被遮盖的 IMF 分量之间的关系；
+  \item 利用其他污染物特征（PM$_{2.5}$、PM$_{10}$ 等）辅助推断；
+  \item 学习时间步之间的上下文依赖。
+\end{enumerate}
+这些能力直接迁移到下游的污染物浓度预测任务。
+
+\subsection{局限性}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{VMD 边缘效应}：序列两端会出现端点失真，14 天窗口相对短，影响有限；
+  \item \textbf{伪标签误差传播}：Student 继承 Teacher 偏差，需通过置信度阈值 + 低权重缓解；
+  \item \textbf{计算成本}：VMD 增加预处理时间，但 $K=4$ 时增量很小；
+  \item \textbf{预训练任务与下游任务的差异}：IMF 预测与污染物浓度预测虽相关但不完全相同。
+\end{itemize}
+
+% =============================================================================
 \section{集成模型（Ensemble）}
 % =============================================================================
 设 $M$ 个子模型 $\{f_m\}_{m=1}^{M}$，对应权重 $\vect{w} = (w_1,\dots,w_M)$（默认均匀）：
@@ -574,6 +940,23 @@ CNN（多尺度卷积）、
 Hybrid（三分支 + 六路交叉注意力 + softmax 加权）以及
 Ensemble（加权平均）共 5 种模型族。
 
+在数据预处理层面，引入变分模态分解（VMD）将 AQI 序列分解为 $K$ 个
+本征模态函数（IMF），降低序列的非平稳性，输入维度从 9 维扩展为 $8+K$ 维。
+
+在模型架构层面，提出 VMD-CNN-BiLSTM-Attention 混合模型，采用双头设计
+（预训练头 + 微调头），支持预训练-微调范式。共享 Backbone 由多尺度 CNN、
+双向 LSTM 和时间步注意力组成，能够同时捕捉空间耦合关系、时序依赖和
+关键时间步信息。
+
+在训练范式层面，支持三种模式：
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{全监督}：在完整标注数据上直接训练；
+  \item \textbf{半监督（伪标签法）}：Teacher 在有标签数据上训练，生成伪标签扩展训练集，
+        Student 在合并数据上联合训练；
+  \item \textbf{预训练-微调}：先在无标签数据上通过掩码自监督预训练 Backbone，
+       再用预训练权重初始化 Teacher 和 Student，进行半监督微调。
+\end{enumerate}
+
 训练侧采用 Adam + OneCycleLR + 梯度裁剪 + 早停 + 反平滑早停，
 损失侧在 MSE 之上叠加方差与差分下界惩罚，缓解"均值回归"导致的
 预测塌缩。推理侧使用 14 天窗口的自回归预测，并以软饱和代替
@@ -595,6 +978,13 @@ Ensemble（加权平均）共 5 种模型族。
      & $h$（nhead） & 4 \\
      & $L$（num\_layers） & 4 \\
      & $\mathrm{dropout}$ & 0.1 \\ \midrule
+VMD & $K$（模态数） & 4 \\
+    & $\alpha$（带宽约束） & 2000 \\
+    & $\tau$（噪声容忍） & 0 \\
+    & $\epsilon$（收敛容差） & $10^{-7}$ \\ \midrule
+VMD-CNN-BiLSTM & $F_{\text{cnn}}$（CNN 卷积核数） & 64 \\
+               & $H_{\text{bilstm}}$（BiLSTM 隐藏层） & 128 \\
+               & $L_{\text{bilstm}}$（BiLSTM 层数） & 2 \\ \midrule
 训练 & epochs & 250 \\
      & batch\_size & 32 \\
      & $\eta_0$ & $3\times 10^{-4}$ \\
@@ -603,6 +993,16 @@ Ensemble（加权平均）共 5 种模型族。
      & grad\_clip & 1.0 \\
      & early\_stop\_patience & 40 \\
      & loss\_type & mse\_antismooth \\ \midrule
+半监督 & $\rho_l$（有标签比例） & 0.4 \\
+       & $\rho_u$（无标签比例） & 0.4 \\
+       & $\rho_{\text{test}}$（测试比例） & 0.2 \\
+       & $\tau_c$（置信度阈值） & 0.85 \\
+       & Teacher epochs & 80 \\
+       & Student epochs & 120 \\ \midrule
+预训练 & $E_{\text{pre}}$（预训练轮数） & 60 \\
+       & $p_{\text{mask}}$（掩码比例） & 0.3 \\
+       & $\eta_{\text{pre}}$（预训练学习率） & $5\times 10^{-4}$ \\
+       & $P_{\text{pre}}$（早停 patience） & 20 \\ \midrule
 AntiSmoothing & $\lambda_{\text{var}},\, \lambda_{\text{diff}}$ & 0.1, 0.05 \\
               & $\tau_{\text{var}},\, \tau_{\text{diff}}$ & 0.5, 0.5 \\
               & $E_{\text{warm}}$ & 20 \\

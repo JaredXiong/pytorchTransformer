@@ -256,6 +256,42 @@ def parse_args():
         '--no-soft-clip', dest='no_soft_clip', action='store_true', default=False,
         help='关闭推理软饱和（恢复硬裁剪）',
     )
+    # 半监督与 VMD
+    parser.add_argument(
+        '--semi-supervised', dest='semi_supervised', action='store_true',
+        help='启用半监督训练（仅 vmd_cnn_bilstm_attention 模型支持）',
+    )
+    parser.add_argument('--vmd-k', type=int, help='VMD 模态数（默认从 config 读取）')
+    parser.add_argument('--no-vmd', dest='no_vmd', action='store_true', help='关闭 VMD 分解')
+    parser.add_argument(
+        '--pseudo-threshold', dest='pseudo_threshold', type=float,
+        help='伪标签置信度阈值',
+    )
+    parser.add_argument(
+        '--teacher-epochs', dest='teacher_epochs', type=int,
+        help='Teacher 训练轮数',
+    )
+    parser.add_argument(
+        '--student-epochs', dest='student_epochs', type=int,
+        help='Student 训练轮数',
+    )
+    # 预训练-微调(VMD 半监督基础上)
+    parser.add_argument(
+        '--pretrain', dest='pretrain', action='store_true',
+        help='启用无监督预训练-有监督微调范式(需同时 --semi-supervised)',
+    )
+    parser.add_argument(
+        '--pretrain-epochs', dest='pretrain_epochs', type=int, default=None,
+        help='预训练轮数(默认从 config 读取)',
+    )
+    parser.add_argument(
+        '--pretrain-mask-ratio', dest='pretrain_mask_ratio', type=float, default=None,
+        help='掩码比例 0~1',
+    )
+    parser.add_argument(
+        '--pretrain-lr', dest='pretrain_lr', type=float, default=None,
+        help='预训练学习率',
+    )
     return parser.parse_args()
 
 
@@ -303,14 +339,106 @@ def main() -> int:
         if args.no_soft_clip:
             config.prediction.soft_clip = False
 
-        train_loader, test_loader, scaler, features, dates, data, raw_data, _ = prepare_data()
+        # 应用 VMD / 半监督 CLI 覆盖
+        if args.no_vmd:
+            config.vmd.enabled = False
+        if args.vmd_k is not None:
+            config.vmd.K = args.vmd_k
+        if args.semi_supervised:
+            config.semi.enabled = True
+        if args.pseudo_threshold is not None:
+            config.semi.pseudo_confidence_threshold = args.pseudo_threshold
+        if args.teacher_epochs is not None:
+            config.semi.teacher_epochs = args.teacher_epochs
+        if args.student_epochs is not None:
+            config.semi.student_epochs = args.student_epochs
+
+        # 应用预训练配置覆盖
+        if args.pretrain:
+            config.pretrain.enabled = True
+        if args.pretrain_epochs is not None:
+            config.pretrain.epochs = args.pretrain_epochs
+        if args.pretrain_mask_ratio is not None:
+            config.pretrain.mask_ratio = args.pretrain_mask_ratio
+        if args.pretrain_lr is not None:
+            config.pretrain.learning_rate = args.pretrain_lr
+
+        train_loader, test_loader, scaler, features, dates, data, raw_data, processor = prepare_data()
 
         device = get_device()
         logger.info(f"使用设备: {device}")
 
-        result = train_single_model(args.model, train_loader, test_loader, device)
-        model = result['model']
-        history = result['history']
+        if config.semi.enabled:
+            logger.info("=" * 60)
+            logger.info("半监督模式已启用：跳过默认的全监督训练，直接进入 VMD-CNN-BiLSTM-Attention 半监督流程")
+            logger.info("=" * 60)
+        else:
+            result = train_single_model(args.model, train_loader, test_loader, device)
+            model = result['model']
+            history = result['history']
+
+        if config.semi.enabled:
+            logger.info("=" * 60)
+            logger.info("运行半监督训练流程 (VMD-CNN-BiLSTM-Attention)")
+            logger.info("=" * 60)
+            from air_quality.data.vmd import VMDDecomposer
+            from air_quality.data.vmd_features import apply_vmd_to_aqi
+            from air_quality.training import SemiSupervisedTrainer
+
+            # 从 processor 拿完整序列（覆盖训练 + 测试区间）
+            full_X, full_y = processor.create_sequences(data)
+            if config.vmd.enabled:
+                decomposer = VMDDecomposer(
+                    K=config.vmd.K, alpha=config.vmd.alpha,
+                    tau=config.vmd.tau, DC=config.vmd.DC,
+                    init=config.vmd.init, tol=config.vmd.tol,
+                )
+                full_X_vmd = apply_vmd_to_aqi(full_X, decomposer)
+            else:
+                # 不启用 VMD 时直接使用原始 9 维特征
+                full_X_vmd = full_X
+
+            # 三段划分
+            (X_lab, y_lab), (X_unl, y_unl), (X_te, y_te) = processor.split_three_way(
+                full_X_vmd, full_y,
+                ratios=(
+                    config.semi.labeled_ratio,
+                    config.semi.unlabeled_ratio,
+                    config.semi.test_ratio,
+                ),
+            )
+            logger.info(f"半监督数据集: labeled={len(X_lab)}, unlabeled={len(X_unl)}, test={len(X_te)}")
+
+            if config.pretrain.enabled:
+                from air_quality.training import PretrainFinetuneTrainer
+                semi_trainer = PretrainFinetuneTrainer(
+                    model_type='vmd_cnn_bilstm_attention',
+                    input_size=full_X_vmd.shape[2],
+                    device=str(device),
+                    teacher_epochs=config.semi.teacher_epochs,
+                    student_epochs=config.semi.student_epochs,
+                    pseudo_confidence_threshold=config.semi.pseudo_confidence_threshold,
+                    pretrain_config=config.pretrain,
+                )
+                logger.info("启用预训练-微调范式(Phase 0: 掩码自监督预训练)")
+            else:
+                semi_trainer = SemiSupervisedTrainer(
+                    model_type='vmd_cnn_bilstm_attention',
+                    input_size=full_X_vmd.shape[2],
+                    device=str(device),
+                    teacher_epochs=config.semi.teacher_epochs,
+                    student_epochs=config.semi.student_epochs,
+                    pseudo_confidence_threshold=config.semi.pseudo_confidence_threshold,
+                )
+            model, semi_metrics = semi_trainer.fit(
+                X_labeled=X_lab, y_labeled=y_lab,
+                X_unlabeled=X_unl, y_unlabeled=y_unl,
+                X_test=X_te, y_test=y_te,
+            )
+            history = semi_trainer.history
+            logger.info(
+                f"半监督训练完成，测试损失: {semi_metrics['test_loss']:.6f}"
+            )
 
         save_artifacts(model, scaler)
         log_training_summary(history)

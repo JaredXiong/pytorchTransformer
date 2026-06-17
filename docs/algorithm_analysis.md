@@ -8,14 +8,13 @@
   - [2.2 LSTM](#22-lstm)
   - [2.3 CNN](#23-cnn)
   - [2.4 Hybrid](#24-hybrid)
+  - [2.5 VMD-CNN-BiLSTM-Attention](#25-vmd-cnn-bilstm-attention)
 - [3. 监督学习适配性分析](#3-监督学习适配性分析)
 - [4. 准确性提升方案](#4-准确性提升方案)
-  - [4.1 推荐新增算法](#41-推荐新增算法)
-  - [4.2 特征工程优化](#42-特征工程优化)
-  - [4.3 模型融合策略](#43-模型融合策略)
-  - [4.4 架构改进方向](#44-架构改进方向)
 - [5. 综合评估与建议](#5-综合评估与建议)
 - [6. 数据预处理与可视化一致性](#6-数据预处理与可视化一致性)
+- [7. 半监督范式：VMD-CNN-BiLSTM-Attention + 伪标签](#7-半监督范式vmd-cnn-bilstm-attention--伪标签)
+- [8. 预训练-微调范式：VMD-CNN-BiLSTM-Attention + 掩码自监督](#8-预训练-微调范式vmd-cnn-bilstm-attention--掩码自监督)
 
 ---
 
@@ -331,6 +330,90 @@ class HybridModel(BaseModel):
 - 模型参数量较大
 - 训练时间较长
 - 可能存在过拟合风险
+
+---
+
+### 2.5 VMD-CNN-BiLSTM-Attention
+
+**架构原理**
+
+VMD-CNN-BiLSTM-Attention 是专为空气质量预测设计的混合架构，将变分模态分解（VMD）、多尺度卷积神经网络（CNN）、双向长短期记忆网络（BiLSTM）和时间步注意力机制有机结合。
+
+**核心思想**：
+1. VMD 将 AQI 分解为多个平稳的 IMF 分量，降低序列的非平稳性
+2. 多尺度 CNN 提取不同时间尺度的局部空间特征
+3. BiLSTM 捕获前后文双向时序依赖关系
+4. Attention 机制自动聚焦对预测贡献最大的历史时刻
+
+**网络结构**：
+
+```
+输入层 (14×9)
+    ↓
+VMD 分解: AQI → K 个 IMF 分量
+    ↓
+特征拼接: [IMF_1, ..., IMF_K, PM2.5, PM10, NO2, SO2, CO, O3, month, season]
+    ↓
+输入投影: (8+K)维 → 64维 (F_cnn)
+    ↓
+多尺度卷积（并行）
+  ├── Conv1d(kernel=3): 捕获短期模式
+  ├── Conv1d(kernel=5): 捕获中期模式
+  └── Conv1d(kernel=7): 捕获长期模式
+  每个分支: Conv1d → BN → ReLU
+    ↓
+特征拼接: 64×3 = 192维
+    ↓
+BatchNorm → ReLU → AdaptiveMaxPool1d
+    ↓
+双向 LSTM (2层, hidden=128)
+    ↓
+时间步注意力 (自动聚焦关键时间步)
+    ↓
+┌────────────────────────────────────────┐
+│           双头设计 (Dual-Head)           │
+├───────────────────┬────────────────────┤
+│   预训练头         │   微调头            │
+│   Linear(256→K)   │   Linear(256→128)  │
+│   预测 IMF 分量    │   → ReLU → Dropout │
+│                   │   → Linear(128→7)  │
+│                   │   预测污染物浓度     │
+└───────────────────┴────────────────────┘
+```
+
+**双头设计**：
+- `pretrain_head`：输出维度 K，用于预训练阶段预测被遮盖的 IMF 分量
+- `finetune_head`：输出维度 7，用于微调阶段预测污染物浓度
+- `forward(x, mode='pretrain')` 使用预训练头
+- `forward(x, mode='finetune')` 使用微调头（默认）
+
+**代码实现**（`src/air_quality/models/vmd_cnn_bilstm_attention.py`）：
+```python
+class VMDCNNBILSTMAttentionModel(BaseModel):
+    def __init__(self, ..., vmd_K=4, cnn_filters=64, bilstm_hidden=128):
+        # 共享 Backbone
+        self.input_proj = nn.Linear(input_size, cnn_filters)
+        self.conv3 = nn.Conv1d(cnn_filters, cnn_filters, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(cnn_filters, cnn_filters, kernel_size=5, padding=2)
+        self.conv7 = nn.Conv1d(cnn_filters, cnn_filters, kernel_size=7, padding=3)
+        self.bilstm = nn.LSTM(cnn_filters*3, bilstm_hidden, 2, bidirectional=True)
+        self.attention = TemporalAttention(bilstm_hidden*2)
+        # 双头
+        self.pretrain_head = nn.Linear(bilstm_hidden*2, vmd_K)
+        self.finetune_head = nn.Sequential(...)
+```
+
+**优势**：
+- VMD 分解降低序列非平稳性，提升预测稳定性
+- 多尺度 CNN 同时捕获不同时间粒度的模式
+- 双向 LSTM 利用前后文信息
+- 注意力机制自动聚焦关键时间步
+- 双头设计支持预训练-微调范式
+
+**局限**：
+- VMD 增加预处理时间
+- 模型结构较复杂，超参数较多
+- 需要 VMD 库（vmdpy）依赖
 
 ---
 
@@ -735,3 +818,60 @@ plot_backtest_results(
 *文档生成日期：2026-06-16*
 *项目版本：v0.0.2*
 *最近更新：补充数据预处理与可视化一致性章节（`y_true_raw` 修复回测图表 Y 轴截断问题）*
+
+---
+
+## 半监督范式：VMD-CNN-BiLSTM-Attention + 伪标签
+
+详见 `docs/superpowers/specs/2026-06-16-vmd-semi-supervised-design.md`。
+
+### 关键设计
+
+- **VMD 分解**：仅作用于 AQI 单变量，K=4（默认，可在 config 覆盖）
+- **半监督划分**：40% 有标签 + 40% 无标签 + 20% 测试
+- **伪标签法**：Teacher → 伪标签（置信度 ≥ 0.85）→ Student 联合训练
+- **架构流**：AQI → VMD(K=4) → 多尺度 CNN → BiLSTM → Attention → FC
+
+### 训练流程
+
+1. **Phase 1 — Teacher 预训练**：在 40% 有标签数据上全监督训练
+2. **Phase 2 — 伪标签生成**：Teacher 推理 40% 无标签数据，过滤低置信度样本
+3. **Phase 3 — Student 联合训练**：在 40% 真标签 + 高置信伪标签上训练
+4. **Phase 4 — 测试集评估**：在 20% 测试集上评估指标
+
+### 范式合理性
+
+详见 spec 第 8 节（合理性 / 局限性 / 预期效果）。
+
+**合理性**：
+- 北京 2015-2024 约 3500+ 天，足够支撑 40/40/20 划分
+- VMD 分解 AQI 符合多尺度耦合机理
+- 伪标签利用未标注数据缓解标注稀缺
+
+**局限性**：
+- VMD 边缘效应（14 天窗口影响有限）
+- 伪标签误差传播（通过置信度阈值 + 加权缓解）
+
+---
+
+## 预训练-微调范式：VMD-CNN-BiLSTM-Attention + 掩码自监督
+
+详见 `docs/superpowers/specs/2026-06-17-vmd-pretrain-finetune-design.md`。
+
+### 三阶段流水线
+
+1. **预训练**：仅在 40% unlabeled 段，掩码自监督预测被遮盖的 IMF
+2. **伪标签**：Teacher 在 40% labeled 上训练，推理 unlabeled 生成伪标签
+3. **微调**：Student 用预训练 backbone 初始化，联合 labeled + 伪标签 训练
+
+### 共享 backbone
+
+`VMDCNNBILSTMAttentionModel` 拆为：
+
+- 共享 backbone（input_proj + CNN + BiLSTM + Attention）
+- `pretrain_head`：Linear → K，预测被遮盖的 IMF
+- `finetune_head`：Sequential，预测 7 维污染物
+
+### 兼容性
+
+`forward(x, mode='finetune')` 默认，行为完全向后兼容。

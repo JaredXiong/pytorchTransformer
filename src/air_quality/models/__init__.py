@@ -7,6 +7,7 @@ from .lstm import LSTMModel
 from .cnn import CNNModel
 from .hybrid import HybridModel
 from .ensemble import EnsembleModel
+from .vmd_cnn_bilstm_attention import VMDCNNBILSTMAttentionModel
 from .factory import create_model
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     'CNNModel',
     'HybridModel',
     'EnsembleModel',
+    'VMDCNNBILSTMAttentionModel',
     'create_model',
 ]

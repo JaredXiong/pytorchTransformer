@@ -202,6 +202,34 @@ class AirQualityDataProcessor:
 
         return np.array(xs), np.array(ys)
 
+    def split_three_way(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        ratios: tuple = (0.4, 0.4, 0.2),
+    ) -> tuple:
+        """按时间顺序三段划分（不打乱），保持时序连续性。
+
+        用于半监督学习的 40% 有标签 / 40% 无标签 / 20% 测试划分。
+
+        Args:
+            X: (N, seq_length, n_features) 序列
+            y: (N, prediction_days, output_size) 目标
+            ratios: 三段比例之和必须为 1.0
+
+        Returns:
+            ((X_labeled, y_labeled), (X_unlabeled, y_unlabeled), (X_test, y_test))
+        """
+        assert abs(sum(ratios) - 1.0) < 1e-6, f"比例之和必须为 1.0，当前: {sum(ratios)}"
+        n = len(X)
+        n_label = int(n * ratios[0])
+        n_unlabel = int(n * ratios[1])
+        return (
+            (X[:n_label], y[:n_label]),
+            (X[n_label:n_label + n_unlabel], y[n_label:n_label + n_unlabel]),
+            (X[n_label + n_unlabel:], y[n_label + n_unlabel:]),
+        )
+
 
 def get_device() -> torch.device:
     """检测并返回合适的设备"""

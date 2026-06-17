@@ -96,6 +96,45 @@ class HybridModelConfig:
     residual_weight: float = 0.3  # 残差权重
 
 
+@dataclass
+class VMDConfig:
+    """VMD 分解配置"""
+    enabled: bool = True
+    K: int = 4                       # IMF 模态数
+    alpha: float = 2000              # 带宽约束
+    tau: float = 0                   # 噪声容忍
+    DC: int = 0                      # 是否保留 DC
+    init: int = 1                    # 初始化方式
+    tol: float = 1e-7                # 收敛容差
+
+
+@dataclass
+class SemiSupervisedConfig:
+    """半监督训练配置"""
+    enabled: bool = False
+    labeled_ratio: float = 0.4
+    unlabeled_ratio: float = 0.4
+    test_ratio: float = 0.2
+    teacher_epochs: int = 80
+    student_epochs: int = 120
+    pseudo_confidence_threshold: float = 0.85
+    pseudo_loss_weight: float = 0.5
+    early_stop_patience: int = 30
+
+
+@dataclass
+class PretrainConfig:
+    """无监督预训练配置(VMD 预训练-微调范式)"""
+    enabled: bool = False
+    epochs: int = 60
+    mask_ratio: float = 0.3
+    learning_rate: float = 5e-4
+    weight_decay: float = 3e-4
+    batch_size: int = 32
+    early_stop_patience: int = 20
+    target: str = 'imf'  # 固定:只预测 K 个 IMF
+
+
 class Config:
     """统一配置类"""
     def __init__(self):
@@ -105,6 +144,9 @@ class Config:
         self.file = FileConfig()
         self.prediction = PredictionConfig()
         self.hybrid = HybridModelConfig()
+        self.vmd = VMDConfig()
+        self.semi = SemiSupervisedConfig()
+        self.pretrain = PretrainConfig()
 
     def update_from_dict(self, config_dict: dict):
         """从字典更新配置"""

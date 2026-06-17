@@ -10,12 +10,14 @@ def create_model(model_type: str, input_size: int, **kwargs) -> BaseModel:
     from .lstm import LSTMModel
     from .cnn import CNNModel
     from .hybrid import HybridModel
+    from .vmd_cnn_bilstm_attention import VMDCNNBILSTMAttentionModel
 
     model_classes = {
         'transformer': TransformerModel,
         'lstm': LSTMModel,
         'cnn': CNNModel,
         'hybrid': HybridModel,
+        'vmd_cnn_bilstm_attention': VMDCNNBILSTMAttentionModel,
     }
 
     if model_type not in model_classes:

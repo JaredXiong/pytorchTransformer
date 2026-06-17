@@ -22,6 +22,8 @@ from .models import (
     create_model,
 )
 from .training import ModelTrainer, MetricsTracker, get_loss_function, WeightedMSELoss
+from .training.pretrain import Pretrainer, compute_masked_mse
+from .training.pretrain_finetune import PretrainFinetuneTrainer
 from .inference import (
     AirQualityPredictor,
     PredictionResult,
@@ -59,6 +61,9 @@ __all__ = [
     "MetricsTracker",
     "get_loss_function",
     "WeightedMSELoss",
+    "Pretrainer",
+    "compute_masked_mse",
+    "PretrainFinetuneTrainer",
     # inference
     "AirQualityPredictor",
     "PredictionResult",

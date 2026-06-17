@@ -18,6 +18,7 @@
 | LSTM | 门控循环网络 | 长期依赖建模，序列数据天然适配 |
 | CNN | 多尺度卷积 | 局部特征提取，训练速度最快 |
 | Hybrid | 混合模型 | 集成 Transformer + LSTM + CNN，交叉注意力融合 |
+| VMD-CNN-BiLSTM-Attention | VMD + 多尺度 CNN + BiLSTM + 注意力 | 专为空气质量预测设计，支持半监督与预训练-微调 |
 | Ensemble | 集成模型 | 加权平均融合多个基模型，提升预测稳定性 |
 
 ## 快速开始
@@ -64,6 +65,55 @@ python -m scripts.compare_models
 python -m scripts.compare_models --models transformer lstm cnn hybrid
 ```
 
+### 半监督训练 (VMD-CNN-BiLSTM-Attention)
+
+数据划分：40% 有标签 + 40% 无标签（伪标签扩展）+ 20% 测试。
+
+```bash
+# 启用半监督（默认 VMD K=4）
+python -m scripts.train --semi-supervised
+
+# 自定义 VMD 模态数
+python -m scripts.train --semi-supervised --vmd-k 6
+
+# 关闭 VMD，对比纯半监督
+python -m scripts.train --semi-supervised --no-vmd
+
+# 调节伪标签置信度阈值
+python -m scripts.train --semi-supervised --pseudo-threshold 0.9
+
+# 调节 Teacher / Student 训练轮数
+python -m scripts.train --semi-supervised --teacher-epochs 100 --student-epochs 150
+```
+
+**注意**：启用 `--semi-supervised` 时会跳过默认的全监督训练（避免双倍时间），仅运行 VMD-CNN-BiLSTM-Attention 的 4 阶段半监督流程。
+
+### 半监督 CLI 参数
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `--semi-supervised` | 启用半监督训练 | 关闭 |
+| `--vmd-k` | VMD 模态数 K | 4 |
+| `--no-vmd` | 关闭 VMD 分解 | 启用 |
+| `--pseudo-threshold` | 伪标签置信度阈值 | 0.85 |
+| `--teacher-epochs` | Teacher 训练轮数 | 80 |
+| `--student-epochs` | Student 训练轮数 | 120 |
+
+### 预训练-微调半监督训练 (VMD-CNN-BiLSTM-Attention)
+
+```bash
+# 启用预训练-微调（必须在 --semi-supervised 之后）
+python -m scripts.train --semi-supervised --pretrain
+
+# 自定义预训练轮数
+python -m scripts.train --semi-supervised --pretrain --pretrain-epochs 30
+
+# 自定义掩码比例
+python -m scripts.train --semi-supervised --pretrain --pretrain-mask-ratio 0.5
+```
+
+三阶段流水线：预训练（unlabeled 段掩码自监督）→ 伪标签（Teacher 推理）→ 微调（Student 联合训练）。
+
 ### 评估与预测
 
 ```bash
@@ -94,7 +144,9 @@ result = predictor.forecast(input_sequence)
 pytorchTransformer/
 ├── data/raw/                       # 原始数据集
 ├── docs/
-│   └── algorithm_analysis.md       # 算法架构分析
+│   ├── algorithm_analysis.md       # 算法架构分析
+│   ├── math_principles.tex         # 算法数学原理（LaTeX）
+│   └── superpowers/                # 设计历史（specs + plans）
 ├── outputs/                        # 训练产物（git 忽略）
 │   ├── checkpoints/                # 模型权重与标准化器
 │   └── figures/                    # 可视化图像
@@ -105,18 +157,26 @@ pytorchTransformer/
 ├── src/air_quality/                # 核心 Python 包
 │   ├── config/                     # dataclass 集中配置
 │   ├── data/                       # 数据加载、预处理、序列构造
+│   │   ├── processor.py            # 数据处理器
+│   │   ├── vmd.py                  # VMD 变分模态分解
+│   │   └── vmd_features.py         # VMD 特征变换
 │   ├── models/                     # 模型架构
 │   │   ├── base.py                 # BaseModel + PositionalEncoding
 │   │   ├── transformer.py
 │   │   ├── lstm.py
 │   │   ├── cnn.py
 │   │   ├── hybrid.py               # HybridModel + Cross-Attention Fusion
+│   │   ├── vmd_cnn_bilstm_attention.py  # VMD-CNN-BiLSTM-Attention
 │   │   ├── ensemble.py             # EnsembleModel
 │   │   └── factory.py              # create_model()
 │   ├── training/                   # 训练器、损失、指标
+│   │   ├── trainer.py              # 全监督训练器
+│   │   ├── semi_supervised.py      # 半监督训练器（伪标签法）
+│   │   ├── pretrain.py             # 掩码自监督预训练器
+│   │   └── pretrain_finetune.py    # 预训练-微调三阶段编排器
 │   ├── inference/                  # 加载权重、自回归预测
 │   └── visualization/              # 训练曲线与预测对比图
-└── tests/                          # 单元测试
+└── tests/                          # 单元测试（95 个）
 ```
 
 ## 配置说明
@@ -146,6 +206,23 @@ TrainingConfig.gradient_clip = 1.0    # 梯度裁剪
 DataConfig.seq_length = 14       # 输入序列长度
 DataConfig.prediction_days = 3   # 预测天数
 DataConfig.train_split_ratio = 0.8  # 训练集比例
+
+# VMD 配置
+VMDConfig.enabled = True         # 启用 VMD 分解
+VMDConfig.K = 4                  # IMF 模态数
+VMDConfig.alpha = 2000           # 带宽约束
+
+# 半监督配置
+SemiSupervisedConfig.enabled = False  # 默认关闭
+SemiSupervisedConfig.labeled_ratio = 0.4
+SemiSupervisedConfig.unlabeled_ratio = 0.4
+SemiSupervisedConfig.test_ratio = 0.2
+SemiSupervisedConfig.pseudo_confidence_threshold = 0.85
+
+# 预训练配置
+PretrainConfig.enabled = False    # 默认关闭
+PretrainConfig.epochs = 60        # 预训练轮数
+PretrainConfig.mask_ratio = 0.3   # 掩码比例
 ```
 
 运行时覆盖配置：
@@ -159,15 +236,16 @@ config.update_from_dict({
 
 ## 测试
 
-测试使用 stdlib `unittest`（未引入 pytest），位于 `tests/`，共 18 个测试。
+测试使用 stdlib `unittest`（未引入 pytest），位于 `tests/`，共 95 个测试。
 
 ```bash
-# 运行所有测试（耗时约 13 秒）
+# 运行所有测试（耗时约 20 秒）
 python -m unittest discover tests -v
 
 # 运行单个测试文件
 python -m unittest tests.test_models -v
-python -m unittest tests.test_visualization -v
+python -m unittest tests.test_pretrain -v
+python -m unittest tests.test_pretrain_finetune -v
 
 # 运行单个测试方法
 python -m unittest tests.test_models.TestModelOutputShape.test_all_models_output_7 -v
