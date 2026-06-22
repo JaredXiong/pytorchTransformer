@@ -821,7 +821,7 @@ plot_backtest_results(
 
 ---
 
-## 半监督范式：VMD-CNN-BiLSTM-Attention + 伪标签
+## 7. 半监督范式：VMD-CNN-BiLSTM-Attention + 伪标签
 
 详见 `docs/superpowers/specs/2026-06-16-vmd-semi-supervised-design.md`。
 
@@ -854,7 +854,7 @@ plot_backtest_results(
 
 ---
 
-## 预训练-微调范式：VMD-CNN-BiLSTM-Attention + 掩码自监督
+## 8. 预训练-微调范式：VMD-CNN-BiLSTM-Attention + 掩码自监督
 
 详见 `docs/superpowers/specs/2026-06-17-vmd-pretrain-finetune-design.md`。
 
