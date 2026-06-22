@@ -11,7 +11,7 @@ from air_quality.config import config
 class TestSemiSupervisedConfig(unittest.TestCase):
     def test_vmd_config_defaults(self):
         self.assertTrue(config.vmd.enabled)
-        self.assertEqual(config.vmd.K, 4)
+        self.assertEqual(config.vmd.K, 3)
         self.assertEqual(config.vmd.alpha, 2000)
 
     def test_semi_supervised_defaults(self):

@@ -22,19 +22,40 @@ class TestPseudoConfidence(unittest.TestCase):
         self.assertEqual(conf.shape, (10,))
         self.assertTrue((conf >= 0).all() and (conf <= 1).all())
 
-    def test_low_variance_high_confidence(self):
-        """低方差预测应有高置信度"""
-        # 全部相同值 → std=0 → 置信度=1.0
-        pred = np.zeros((5, 3, 7))
+    def test_low_variance_low_confidence_no_longer_one(self):
+        """修复后的公式：纯零预测（完全平滑）应得到中低置信度，
+        而不是 1.0。这是修复「过度平滑预测被选为伪标签」的关键。
+        """
+        pred = np.zeros((5, 3, 7))  # std=0，与 anchor 偏离最大
         conf = compute_pseudo_confidence(pred)
-        np.testing.assert_array_almost_equal(conf, np.ones(5))
+        # 新公式：exp(-((0-1)^2)) = exp(-1) ≈ 0.368
+        self.assertTrue((conf < 0.5).all())
+        self.assertTrue((conf > 0.0).all())
+
+    def test_matching_variance_high_confidence(self):
+        """波动幅度匹配锚点（=1 倍 median）应得到最高置信度"""
+        np.random.seed(0)
+        # 第一次构造确定 anchor
+        first = np.random.randn(20, 3, 7)
+        anchor_pred = first
+        # 第二批样本波动与第一批一致 → ratio=1 → confidence=1
+        match_pred = np.random.randn(5, 3, 7)
+        # 用 anchor_pred 计算 conf 锚点，然后验证 match_pred 在该锚点下接近 1
+        # 我们用 target_std 显式传入模拟「labeled 数据锚点」
+        target_std = anchor_pred.std(axis=(0, 1))
+        conf = compute_pseudo_confidence(match_pred, target_std=target_std)
+        # ratio 应当 ≈ 1（采样足够时），confidence 应当 ≈ 1
+        self.assertTrue((conf > 0.5).all())
 
     def test_high_variance_low_confidence(self):
         """高方差预测应有低置信度"""
         np.random.seed(0)
         pred = np.random.randn(5, 3, 7) * 100
-        conf = compute_pseudo_confidence(pred)
-        self.assertTrue((conf < 0.1).all())
+        # 用同分布的低方差样本作为锚点
+        anchor = np.random.randn(50, 3, 7)
+        target_std = anchor.std(axis=(0, 1))
+        conf = compute_pseudo_confidence(pred, target_std=target_std)
+        self.assertTrue((conf < 0.5).all())
 
 
 class TestSemiSupervisedTrainer(unittest.TestCase):

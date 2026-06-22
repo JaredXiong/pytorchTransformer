@@ -36,6 +36,15 @@ class PretrainFinetuneTrainer(SemiSupervisedTrainer):
         learning_rate: float = 3e-4,
         weight_decay: float = 3e-4,
         pretrain_config: Optional[PretrainConfig] = None,
+        # 损失 / 反平滑参数透传给父类（与全监督对齐，避免均值回归）
+        loss_type: str = None,
+        loss_kwargs: Optional[Dict[str, Any]] = None,
+        detect_smoothing: bool = True,
+        smoothing_threshold: float = 0.1,
+        smoothing_stop_patience: int = 15,
+        gradient_clip: float = 1.0,
+        early_stop_patience: int = 30,
+        vmd_K: int = None,
     ):
         super().__init__(
             model_type=model_type,
@@ -47,6 +56,14 @@ class PretrainFinetuneTrainer(SemiSupervisedTrainer):
             batch_size=batch_size,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
+            loss_type=loss_type,
+            loss_kwargs=loss_kwargs,
+            detect_smoothing=detect_smoothing,
+            smoothing_threshold=smoothing_threshold,
+            smoothing_stop_patience=smoothing_stop_patience,
+            gradient_clip=gradient_clip,
+            early_stop_patience=early_stop_patience,
+            vmd_K=vmd_K,
         )
         # 默认从全局 config 读取,允许显式覆盖
         self.pretrain_config: PretrainConfig = pretrain_config or global_config.pretrain

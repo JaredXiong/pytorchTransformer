@@ -46,8 +46,13 @@ def _train_and_save_model(model, processor, tmpdir):
 
     weights = os.path.join(tmpdir, 'model.pth')
     scaler_pkl = os.path.join(tmpdir, 'scaler.pkl')
-    torch.save({'model_state_dict': model.state_dict(),
-                'model_type': model.__class__.__name__}, weights)
+    # checkpoint 必须包含 input_size / output_size（与 save_artifacts 格式一致）
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_type': model.__class__.__name__,
+        'input_size': model.input_size,
+        'output_size': model.output_size,
+    }, weights)
     joblib.dump(scaler, scaler_pkl)
     return weights, scaler_pkl, data, dates
 
@@ -58,19 +63,21 @@ class TestForecast(unittest.TestCase):
         np.random.seed(0)
 
     def test_forecast_input_shape_and_value_ranges(self):
-        """forecast accepts (14, 9) raw input and returns (3, 7) predictions."""
+        """forecast accepts (14, 11) raw input and returns (3, 7) predictions."""
         with tempfile.TemporaryDirectory() as tmp:
             processor = AirQualityDataProcessor(seq_length=14, prediction_days=3)
-            model = create_model('lstm', input_size=9, output_size=7)
+            model = create_model('lstm', input_size=11, output_size=7)
             weights, scaler_pkl, _, _ = _train_and_save_model(model, processor, tmp)
 
             p = AirQualityPredictor(model_weights_path=weights, scaler_path=scaler_pkl)
             p.load_model()
 
+            # 构造 (14, 11) 输入：7 污染物 + 4 周期性编码特征
+            # month=6 (sin=0, cos=-1), season=2 (sin=1, cos=0)
             input_seq = np.array([
-                [50.0, 30.0, 60.0, 25.0, 10.0, 1.0, 50.0, 6, 2],
-                [55.0, 32.0, 62.0, 26.0, 11.0, 1.1, 52.0, 6, 2],
-            ] * 7, dtype=float)  # (14, 9)
+                [50.0, 30.0, 60.0, 25.0, 10.0, 1.0, 50.0, 0.0, -1.0, 1.0, 0.0],
+                [55.0, 32.0, 62.0, 26.0, 11.0, 1.1, 52.0, 0.0, -1.0, 1.0, 0.0],
+            ] * 7, dtype=float)  # (14, 11)
 
             result = p.forecast(input_seq)
             self.assertEqual(result['predictions'].shape, (3, 7))
@@ -78,13 +85,14 @@ class TestForecast(unittest.TestCase):
     def test_forecast_rejects_invalid_month(self):
         with tempfile.TemporaryDirectory() as tmp:
             processor = AirQualityDataProcessor(seq_length=14, prediction_days=3)
-            model = create_model('lstm', input_size=9, output_size=7)
+            model = create_model('lstm', input_size=11, output_size=7)
             weights, scaler_pkl, _, _ = _train_and_save_model(model, processor, tmp)
             p = AirQualityPredictor(model_weights_path=weights, scaler_path=scaler_pkl)
             p.load_model()
 
-            bad = np.zeros((14, 9))
-            bad[:, 7] = 13  # invalid month
+            bad = np.zeros((14, 11))
+            # 周期性编码特征的范围是 [-1, 1]，设置一个超出范围的值
+            bad[:, 7] = 2.0  # invalid month_sin (超出 [-1, 1] 范围)
             with self.assertRaises(ValueError):
                 p.forecast(bad)
 
@@ -97,7 +105,7 @@ class TestBacktest(unittest.TestCase):
     def test_backtest_returns_predictions_for_each_window(self):
         with tempfile.TemporaryDirectory() as tmp:
             processor = AirQualityDataProcessor(seq_length=14, prediction_days=3)
-            model = create_model('lstm', input_size=9, output_size=7)
+            model = create_model('lstm', input_size=11, output_size=7)
             weights, scaler_pkl, data, dates = _train_and_save_model(model, processor, tmp)
 
             p = AirQualityPredictor(model_weights_path=weights, scaler_path=scaler_pkl)

@@ -8,7 +8,7 @@ from typing import List
 @dataclass
 class ModelConfig:
     """模型相关配置"""
-    input_size: int = 9  # 输入特征数量
+    input_size: int = 11  # 输入特征数量（7 污染物 + 4 周期性日历特征）
     d_model: int = 128  # Transformer隐藏层维度
     lstm_hidden: int = 256  # LSTM隐藏层维度
     cnn_filters: int = 128  # CNN过滤器数量
@@ -34,15 +34,15 @@ class TrainingConfig:
     early_stop_patience: int = 40  # 已降低（从 60）以在保守解之前停下
     loss_type: str = 'mse_antismooth'  # 已从 huber 切换到反平滑复合损失
     delta: float = 1.0
-    # 反平滑损失分量
-    lambda_var: float = 0.1
-    lambda_diff: float = 0.05
-    tau_var: float = 0.5
-    tau_diff: float = 0.5
+    # 反平滑损失分量（温和增强，保留修复效果但不过激）
+    lambda_var: float = 0.15   # 温和上调（原 0.1），压制 MSE 主导地位但不过激
+    lambda_diff: float = 0.08  # 温和上调（原 0.05）
+    tau_var: float = 0.55      # 温和上调（原 0.5），要求 pred_std ≥ 55% target_std
+    tau_diff: float = 0.55     # 温和上调（原 0.5）
     lambda_warmup_epochs: int = 20
-    # 反平滑早停信号
+    # 反平滑早停信号（threshold 已从 0.1 上调到 0.3，更早触发）
     detect_smoothing: bool = True
-    smoothing_threshold: float = 0.1
+    smoothing_threshold: float = 0.3
     smoothing_stop_patience: int = 15
 
 
@@ -55,7 +55,7 @@ class DataConfig:
     train_split_ratio: float = 0.8  # 训练集比例
     feature_columns: List[str] = field(default_factory=lambda: [
         'aqi', 'pm2_5_24h', 'pm10_24h', 'no2_24h', 'so2_24h', 'co_24h', 'o3_8h_24h',
-        'month', 'season'
+        'month_sin', 'month_cos', 'season_sin', 'season_cos'
     ])
     target_columns: List[str] = field(default_factory=lambda: [
         'aqi', 'pm2_5_24h', 'pm10_24h', 'no2_24h', 'so2_24h', 'co_24h', 'o3_8h_24h'
@@ -100,12 +100,16 @@ class HybridModelConfig:
 class VMDConfig:
     """VMD 分解配置"""
     enabled: bool = True
-    K: int = 4                       # IMF 模态数
+    K: int = 3                       # IMF 模态数（从 4 降到 3，因为 target='all' 时
+                                     # 输入维度 = 7*K + 2；K=4 时 30 维过大）
     alpha: float = 2000              # 带宽约束
     tau: float = 0                   # 噪声容忍
     DC: int = 0                      # 是否保留 DC
     init: int = 1                    # 初始化方式
     tol: float = 1e-7                # 收敛容差
+    # VMD 目标：'aqi' = 只对 AQI 分解（旧行为，向后兼容）；
+    #           'all' = 对全部 7 个污染物分解（实验性，未验证带来收益）
+    target: str = 'aqi'
 
 
 @dataclass

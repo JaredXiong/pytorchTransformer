@@ -14,12 +14,188 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 
-def plot_training_history(history: dict, save_path: str = None, show: bool = False):
-    """绘制训练历史"""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+def _draw_empty_panel(ax, message: str) -> None:
+    """在子图上渲染一条友好提示并关闭坐标轴（避免空白图）。"""
+    ax.text(0.5, 0.5, message, ha='center', va='center',
+            transform=ax.transAxes, fontsize=11, color='gray', wrap=True)
+    ax.set_title(message.split('\n')[0][:40])
+    ax.axis('off')
 
-    # 损失曲线
-    if 'train_loss' in history and 'test_loss' in history:
+
+def _plot_semi_history(fig, axes, history: dict) -> None:
+    """渲染半监督 / 预训练-微调 训练历史。
+
+    布局（1×3，与全监督 1×2 信息对等）：
+      - 左：各阶段 Train/Test Loss（按阶段拼接 x 轴 + 阶段背景色 + 分隔线）
+      - 中：学习率曲线（按阶段拼接，与全监督右图等价）
+      - 右：反平滑检测信号（每 epoch 被标记的污染物数）+ 伪标签保留率柱状图
+
+    三阶段的 train_loss 来自不同 model 实例，因此 train/test 曲线**不**跨阶段
+    连续拼接，而是按阶段分别绘制并标注阶段背景色；x 轴 epoch 仍连续以便阅读。
+    """
+    pretrain_losses = history.get('pretrain_losses', [])
+    teacher_losses = history.get('teacher_losses', [])
+    student_losses = history.get('student_losses', [])
+    # 反平滑聚合后的分阶段曲线（由 SemiSupervisedTrainer._record_phase_history 写入）
+    teacher_test = history.get('teacher_test_loss', [])
+    student_test = history.get('student_test_loss', [])
+    teacher_lr = history.get('teacher_lr', [])
+    student_lr = history.get('student_lr', [])
+
+    pretrain_n = len(pretrain_losses)
+    teacher_n = len(teacher_losses)
+    student_n = len(student_losses)
+    total_n = pretrain_n + teacher_n + student_n
+
+    ax_loss, ax_lr, ax_aux = axes[0], axes[1], axes[2]
+
+    # ----- 左图：Loss（按阶段） -----
+    if total_n == 0:
+        _draw_empty_panel(ax_loss, 'No loss data\n(各阶段均未产生训练损失)')
+    else:
+        # 阶段区间: [(name, color, start_epoch_1based, n)]
+        segments = [
+            ('Pretrain', '#1f77b4', pretrain_losses, []),
+            ('Teacher', '#ff7f0e', teacher_losses, teacher_test),
+            ('Student', '#2ca02c', student_losses, student_test),
+        ]
+        cursor = 0  # 已分配的 epoch 数（1-based 起点 = cursor）
+        for name, color, train_vals, test_vals in segments:
+            n = len(train_vals)
+            if n == 0:
+                continue
+            start = cursor  # 0-based offset
+            x = range(start + 1, start + n + 1)
+            ax_loss.plot(x, train_vals, label=f'{name} Train', marker='o',
+                         markersize=3, color=color)
+            # 同阶段 test loss（若存在且长度一致）用虚线叠加
+            if len(test_vals) == n:
+                ax_loss.plot(x, test_vals, label=f'{name} Val', marker='x',
+                             markersize=3, color=color, linestyle='--', alpha=0.6)
+            ax_loss.axvspan(start + 0.5, start + n + 0.5, alpha=0.08, color=color)
+            cursor += n
+        # 阶段分隔线（仅在有 ≥2 个非空阶段时画）
+        nonempty_bounds = []
+        c = 0
+        for vals in (pretrain_losses, teacher_losses, student_losses):
+            if len(vals) > 0:
+                c += len(vals)
+                nonempty_bounds.append(c)
+        for b in nonempty_bounds[:-1]:
+            ax_loss.axvline(x=b + 0.5, color='gray', linestyle=':',
+                            linewidth=0.8, alpha=0.6)
+        ax_loss.set_xlabel('Epoch')
+        ax_loss.set_ylabel('Loss')
+        title = 'Training History - Loss (Semi-Supervised)'
+        best_loss = history.get('best_loss')
+        if best_loss is not None and best_loss != float('inf'):
+            title += f'  (Best: {best_loss:.4f})'
+        ax_loss.set_title(title)
+        ax_loss.legend(loc='upper right', fontsize=8)
+        ax_loss.grid(True, alpha=0.3)
+
+    # ----- 中图：学习率曲线（按阶段拼接） -----
+    lr_segments = [
+        ('Pretrain', '#1f77b4', []),  # pretrain 用固定 lr，这里不绘制逐 epoch
+        ('Teacher', '#ff7f0e', teacher_lr),
+        ('Student', '#2ca02c', student_lr),
+    ]
+    has_lr = any(len(v) > 0 for _, _, v in lr_segments)
+    if not has_lr:
+        _draw_empty_panel(ax_lr, 'No learning rate data\n(OneCycleLR 未记录)')
+    else:
+        cursor = 0
+        for name, color, lr_vals in lr_segments:
+            n = len(lr_vals)
+            if n == 0:
+                continue
+            x = range(cursor + 1, cursor + n + 1)
+            ax_lr.plot(x, lr_vals, label=f'{name} LR', color=color, linewidth=1.5)
+            cursor += n
+        ax_lr.set_xlabel('Epoch')
+        ax_lr.set_ylabel('Learning Rate')
+        ax_lr.set_title('Learning Rate Schedule (by Phase)')
+        ax_lr.grid(True, alpha=0.3)
+        ax_lr.ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
+        ax_lr.legend(loc='upper right', fontsize=8)
+
+    # ----- 右图：反平滑信号 + 伪标签保留率 -----
+    # 反平滑标记：每 epoch 被标记为过度平滑的污染物数（跨阶段顺序拼接）
+    flags = history.get('smoothing_flags_per_epoch', [])
+    pseudo_rates = history.get('pseudo_label_rate', [])
+    has_flags = len(flags) > 0
+    has_pseudo = len(pseudo_rates) > 0
+
+    if not has_flags and not has_pseudo:
+        _draw_empty_panel(ax_aux, 'No smoothing / pseudo-label data')
+        return
+
+    # 双 y 轴：左=被标记污染物数（折线），右=伪标签保留率（柱状）
+    if has_flags:
+        n_flagged = [f.get('n_flagged', 0) for f in flags]
+        # 总特征数（取任一非空 flags 记录的长度）
+        total_feat = 7
+        for f in flags:
+            fl = f.get('flags', {})
+            if fl:
+                total_feat = len(fl)
+                break
+        ax_aux.plot(range(1, len(n_flagged) + 1), n_flagged,
+                    color='crimson', marker='.', markersize=4,
+                    label=f'Over-smooth flagged (/{total_feat})')
+        ax_aux.set_xlabel('Epoch')
+        ax_aux.set_ylabel('# Flagged pollutants', color='crimson')
+        ax_aux.tick_params(axis='y', labelcolor='crimson')
+        ax_aux.set_ylim(-0.3, total_feat + 0.3)
+        ax_aux.set_title('Anti-Smoothing Signal & Pseudo-Label Rate')
+        ax_aux.grid(True, alpha=0.2)
+
+        if has_pseudo:
+            ax_aux2 = ax_aux.twinx()
+            # 伪标签阶段数通常 << epoch 数，用右侧短柱表示
+            ax_aux2.bar(range(1, len(pseudo_rates) + 1), pseudo_rates,
+                        color='steelblue', alpha=0.4, edgecolor='navy',
+                        width=0.6, label='Pseudo-label rate')
+            ax_aux2.set_ylabel('Pseudo-label retention rate', color='navy')
+            ax_aux2.tick_params(axis='y', labelcolor='navy')
+            ax_aux2.set_ylim(0, 1)
+            # 合并图例
+            h1, l1 = ax_aux.get_legend_handles_labels()
+            h2, l2 = ax_aux2.get_legend_handles_labels()
+            ax_aux.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7)
+        else:
+            ax_aux.legend(loc='upper right', fontsize=8)
+    else:
+        # 仅有伪标签率
+        ax_aux.bar(range(1, len(pseudo_rates) + 1), pseudo_rates,
+                   color='steelblue', alpha=0.7, edgecolor='black')
+        ax_aux.set_xlabel('Phase')
+        ax_aux.set_ylabel('Pseudo-label retention rate')
+        ax_aux.set_title('Pseudo-Label Rate (by Phase)')
+        ax_aux.set_ylim(0, 1)
+        ax_aux.grid(True, alpha=0.3, axis='y')
+
+
+def plot_training_history(history: dict, save_path: str = None, show: bool = False):
+    """绘制训练历史。
+
+    自动识别两种 history 格式并渲染**信息对等**的图表：
+    - 全监督 (``train_loss`` + ``test_loss`` + ``lr``): 1×2 — 训练/验证 loss + 学习率
+    - 半监督 (``teacher_losses`` + ``student_losses`` + 可选 ``pretrain_losses`` +
+      ``pseudo_label_rate`` + ``<phase>_lr``/``<phase>_test_loss``/
+      ``smoothing_flags_per_epoch``): 1×3 — 分阶段 loss + 学习率 + 反平滑信号/伪标签率
+
+    半监督字段缺失时会友好降级（显示提示文字而非空白图），修复"字段不匹配导致空白图表"。
+    """
+    has_pretrain = bool(history.get('pretrain_losses'))
+    has_semi = bool(history.get('teacher_losses') or history.get('student_losses'))
+
+    if has_semi or has_pretrain:
+        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+        _plot_semi_history(fig, axes, history)
+    elif 'train_loss' in history and 'test_loss' in history:
+        # === 全监督历史 ===
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         train_losses = history.get('train_loss', [])
         test_losses = history.get('test_loss', [])
         epochs = range(1, len(train_losses) + 1)
@@ -38,20 +214,27 @@ def plot_training_history(history: dict, save_path: str = None, show: bool = Fal
         axes[0].legend()
         axes[0].grid(True, alpha=0.3)
 
-    # 最佳epoch标注
-    if 'best_loss' in history and history['best_loss'] != float('inf'):
-        axes[0].set_title(f'Training History - Loss (Best: {history["best_loss"]:.4f})')
+        if 'best_loss' in history and history['best_loss'] != float('inf'):
+            axes[0].set_title(f'Training History - Loss (Best: {history["best_loss"]:.4f})')
 
-    # 学习率曲线
-    if 'lr' in history and len(history['lr']) > 0:
-        lr_values = history['lr']
-        lr_epochs = range(1, len(lr_values) + 1)
-        axes[1].plot(lr_epochs, lr_values, color='green', linewidth=1.5)
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Learning Rate')
-        axes[1].set_title('Learning Rate Schedule')
-        axes[1].grid(True, alpha=0.3)
-        axes[1].ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
+        # 学习率曲线
+        if 'lr' in history and len(history['lr']) > 0:
+            lr_values = history['lr']
+            lr_epochs = range(1, len(lr_values) + 1)
+            axes[1].plot(lr_epochs, lr_values, color='green', linewidth=1.5)
+            axes[1].set_xlabel('Epoch')
+            axes[1].set_ylabel('Learning Rate')
+            axes[1].set_title('Learning Rate Schedule')
+            axes[1].grid(True, alpha=0.3)
+            axes[1].ticklabel_format(style='scientific', axis='y', scilimits=(0, 0))
+        else:
+            _draw_empty_panel(axes[1], 'No learning rate data')
+    else:
+        # === 未知格式：友好提示 ===
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        _draw_empty_panel(axes[0],
+                          'Unsupported history format\nkeys: ' + ', '.join(history.keys()))
+        axes[1].axis('off')
 
     plt.tight_layout()
 

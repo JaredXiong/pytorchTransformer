@@ -62,8 +62,9 @@ class TestFullSemiPipeline(unittest.TestCase):
                 self.assertGreater(len(X_lab), 0)
                 self.assertGreater(len(X_unl), 0)
                 self.assertGreater(len(X_te), 0)
-                # 输入维度：8 (非 AQI) + 4 (VMD K) = 12
-                self.assertEqual(X_vmd.shape[2], 12)
+                # 输入维度：6 (非 AQI 污染物) + 4 (周期性编码) + K (VMD IMF) = 10 + K
+                # 这里 K=4（decomposer 实例化时指定），所以是 10+4=14
+                self.assertEqual(X_vmd.shape[2], 10 + decomposer.K)
 
                 # 跑半监督训练（epochs=2 以避开 PyTorch OneCycleLR 在 epochs=1 时的 zero-division 错误）
                 trainer = SemiSupervisedTrainer(

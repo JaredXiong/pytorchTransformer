@@ -13,6 +13,8 @@ import joblib
 
 from ..config import config
 from ..data import get_device, validate_prediction, calculate_metrics
+from ..data.vmd import VMDDecomposer
+from ..data.vmd_features import apply_vmd_to_aqi, apply_vmd_to_features, POLLUTANT_ORDER
 from ..models import create_model
 
 logger = logging.getLogger(__name__)
@@ -98,12 +100,14 @@ class AirQualityPredictor:
         (0.0, 500.0),    # so2_24h
         (0.0, 50.0),     # co_24h
         (0.0, 500.0),    # o3_8h_24h
-        (1, 12),         # month (int)
-        (1, 4),          # season (int)
+        (-1.0, 1.0),     # month_sin (周期性编码)
+        (-1.0, 1.0),     # month_cos (周期性编码)
+        (-1.0, 1.0),     # season_sin (周期性编码)
+        (-1.0, 1.0),     # season_cos (周期性编码)
     ]
     INPUT_COLUMNS = [
         'aqi', 'pm2_5_24h', 'pm10_24h', 'no2_24h', 'so2_24h',
-        'co_24h', 'o3_8h_24h', 'month', 'season',
+        'co_24h', 'o3_8h_24h', 'month_sin', 'month_cos', 'season_sin', 'season_cos',
     ]
 
     def __init__(self, model_weights_path: str = None, scaler_path: str = None):
@@ -112,6 +116,10 @@ class AirQualityPredictor:
         self.device = get_device()
         self.model = None
         self.scaler = None
+        # VMD-CNN-BiLSTM-Attention 模型需要 VMDDecomposer 重建 12 维输入
+        self._vmd_decomposer: VMDDecomposer | None = None
+        # VMD target: 'aqi' 仅分解 AQI；'all' 分解全部 7 个污染物
+        self._vmd_target: str = 'aqi'
 
     def load_model(self) -> None:
         if not os.path.exists(self.model_weights_path):
@@ -125,15 +133,41 @@ class AirQualityPredictor:
             checkpoint = torch.load(self.model_weights_path, map_location=self.device)
             model_type = self._infer_model_type(checkpoint)
 
+            # VMD 半监督训练会把 9 维特征扩展为 8+K 维，所以 input_size
+            # 必须从 checkpoint 读取，config 中的默认 9 维不能用作兜底。
+            input_size = checkpoint['input_size']
+            output_size = checkpoint['output_size']
+
+            # VMD 模型需传入 vmd_K，避免 pretrain_head 维度不匹配
+            create_kwargs = {}
+            if model_type == 'vmd_cnn_bilstm_attention' and 'vmd_params' in checkpoint:
+                create_kwargs['vmd_K'] = checkpoint['vmd_params']['K']
+
             self.model = create_model(
                 model_type=model_type,
-                input_size=config.model.input_size,
-                output_size=config.model.output_size,
+                input_size=input_size,
+                output_size=output_size,
+                **create_kwargs,
             ).to(self.device)
 
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             self.model.load_state_dict(state_dict)
             self.model.eval()
+
+            # VMD 模型：重建 VMDDecomposer 实例 + 记录 vmd_target
+            if model_type == 'vmd_cnn_bilstm_attention':
+                self._vmd_decomposer = VMDDecomposer(**checkpoint['vmd_params'])
+                # 读取训练时的 vmd_target；缺省时根据 input_size 自动推断
+                self._vmd_target = checkpoint.get('vmd_target', 'aqi')
+                # 兜底：如果 checkpoint 没存 vmd_target，用 input_size 反推
+                if 'vmd_target' not in checkpoint:
+                    K = self._vmd_decomposer.K
+                    expected_aqi = K + 8  # K IMFs + 6 pollutants + 2 calendar
+                    expected_all = 7 * K + 2  # 7*K IMFs + 2 calendar
+                    if input_size == expected_all:
+                        self._vmd_target = 'all'
+                    elif input_size == expected_aqi:
+                        self._vmd_target = 'aqi'
         except RuntimeError as e:
             raise ValueError(f"模型权重加载失败: {str(e)}")
 
@@ -141,6 +175,9 @@ class AirQualityPredictor:
     def _infer_model_type(checkpoint: dict) -> str:
         raw = str(checkpoint.get('model_type', 'transformer'))
         lowered = raw.lower()
+        # 复合模型必须在简单模型之前匹配，避免 "bilstm" 中的 "lstm" 误匹配
+        if 'vmd' in lowered or 'bilstm' in lowered:
+            return 'vmd_cnn_bilstm_attention'
         if 'hybrid' in lowered:
             return 'hybrid'
         if 'transformer' in lowered:
@@ -176,13 +213,50 @@ class AirQualityPredictor:
                 )
 
     def _prepare_model_input(self, input_sequence: np.ndarray) -> torch.Tensor:
-        """将原始 (14, 9) 输入转换为模型所需的 (1, 14, 9) 张量。
+        """将原始 (14, 9) 输入转换为模型所需的 (1, 14, F) 张量。
 
-        缩放只作用于前 7 列污染物；后 2 列 (month, season) 保持整数原值。
+        非 VMD 模型：F=9。缩放只作用于前 7 列污染物；后 2 列 (month, season) 保持整数原值。
+        VMD-CNN-BiLSTM-Attention 模型：F=8+K=12。前 7 列污染物做 scaler 缩放后，
+        AQI(idx 0) 被 4 个 IMF 替换，pm2_5..o3(idx 1..6) 保留，最后拼 month/season。
         """
+        # validate_input 假设原始尺度 (0-500 等)。forecast 用它做用户输入校验。
         self.validate_input(input_sequence)
-        scaled = self.scaler.transform(input_sequence[:, :7])
-        model_input = np.hstack([scaled, input_sequence[:, 7:]])
+        return self._build_model_tensor(input_sequence)
+
+    def _vmd_transform(self, poll_scaled: np.ndarray) -> np.ndarray:
+        """对 (T, 7) 缩放后的污染物做 VMD 特征变换，返回 (T, F_vmd)。
+
+        根据 ``self._vmd_target`` 选择两种变换路径：
+        - 'aqi'  (默认)：仅分解 AQI 列，返回 K IMFs + 6 个其他污染物 (T, K+6)
+        - 'all' (推荐)：分解全部 7 个污染物，返回 7*K IMFs (T, 7*K)
+        """
+        if self._vmd_target == 'all':
+            K = self._vmd_decomposer.K
+            # poll_scaled.T → (7, T)；decompose 返回 (7, K, T)
+            imfs = self._vmd_decomposer.decompose(poll_scaled.T)
+            # 重排为 (T, 7, K) 再展平为 (T, 7*K)
+            imfs = imfs.transpose(0, 2, 1).reshape(poll_scaled.shape[0], -1)
+            return imfs
+        # 默认 'aqi' 模式
+        K = self._vmd_decomposer.K
+        aqi_scaled = poll_scaled[:, 0]  # (T,)
+        imfs = self._vmd_decomposer.decompose(aqi_scaled)  # (K, T)
+        imfs = imfs.T  # (T, K)
+        other_pollutants = poll_scaled[:, 1:7]  # (T, 6)
+        return np.hstack([imfs, other_pollutants])  # (T, K+6)
+
+    def _build_model_tensor(self, input_sequence: np.ndarray) -> torch.Tensor:
+        """纯数据转换：(T, 9) → (1, T, F)。**不做** validate_input。
+
+        与 _prepare_model_input 的区别：本函数**不验证**输入范围，
+        供 backtest 等已经在缩放后数据上工作的调用方使用，避免被误判为越界。
+        """
+        scaled = self.scaler.transform(input_sequence[:, :7])  # (T, 7)
+        if self._vmd_decomposer is None:
+            model_input = np.hstack([scaled, input_sequence[:, 7:]])
+        else:
+            vmd_features = self._vmd_transform(scaled)  # (T, K+6) 或 (T, 7K)
+            model_input = np.hstack([vmd_features, input_sequence[:, 7:]])
         return torch.FloatTensor(model_input).unsqueeze(0).to(self.device)
 
     def forecast(self, input_sequence: np.ndarray,
@@ -194,19 +268,63 @@ class AirQualityPredictor:
         input_tensor = self._prepare_model_input(input_sequence)
         num_days = config.data.prediction_days
 
-        predictions = []
-        with torch.no_grad():
-            current_input = input_tensor.clone()
-            for _ in range(num_days):
-                output = self.model(current_input)
-                pred = output[:, -1, :]
-                predictions.append(pred.cpu().numpy()[0])
-                # Splice 7-dim prediction back into 9-dim window (keep month/season from last step)
-                last_step = current_input[:, -1:, :].clone()
-                last_step[:, :, :7] = pred.unsqueeze(1)
-                current_input = torch.cat([current_input[:, 1:, :], last_step], dim=1)
+        if self._vmd_target == 'all':
+            # VMD(target='all') 不支持 K>T=1 的单步重投影，改为一次性 forward 取末尾 N 步
+            with torch.no_grad():
+                output = self.model(input_tensor)  # (1, T, 7)
+                predictions = output[:, -num_days:, :].cpu().numpy()[0]
+        else:
+            # 自回归模式：每步必须用正确 calendar，否则模型被迫按 calendar 预测，
+            # 会出现"阶梯线"现象（calendar 跨年突变时预测值突变）。
+            # 优先用 future_dates 推算周期性编码，否则以窗口最后一帧为起点递增。
+            if future_dates is not None and len(future_dates) >= num_days:
+                fc_list = []
+                for fd in future_dates[:num_days]:
+                    dt = pd.to_datetime(fd)
+                    month = dt.month
+                    season = (month % 12 + 3) // 3
+                    # 周期性编码：month 和 season 各用 sin/cos 表示
+                    month_sin = np.sin(2 * np.pi * month / 12)
+                    month_cos = np.cos(2 * np.pi * month / 12)
+                    season_sin = np.sin(2 * np.pi * season / 4)
+                    season_cos = np.cos(2 * np.pi * season / 4)
+                    fc_list.append([month_sin, month_cos, season_sin, season_cos])
+                future_calendar = torch.FloatTensor(fc_list).unsqueeze(0).to(self.device)
+            else:
+                # 从输入序列的最后 4 个特征（周期性编码）推断未来的 calendar
+                last_cal = input_tensor[:, -1, -4:].clone()  # (1, 4) = [month_sin, month_cos, season_sin, season_cos]
+                # 通过 arctan2 恢复原始月份，然后递增
+                last_month_sin, last_month_cos = last_cal[0, 0].item(), last_cal[0, 1].item()
+                last_month = int(np.arctan2(last_month_sin, last_month_cos) * 12 / (2 * np.pi)) % 12 + 1
+                # 生成未来 calendar
+                fc_list = []
+                for step in range(num_days):
+                    future_month = ((last_month - 1 + step + 1) % 12) + 1
+                    future_season = (future_month % 12 + 3) // 3
+                    month_sin = np.sin(2 * np.pi * future_month / 12)
+                    month_cos = np.cos(2 * np.pi * future_month / 12)
+                    season_sin = np.sin(2 * np.pi * future_season / 4)
+                    season_cos = np.cos(2 * np.pi * future_season / 4)
+                    fc_list.append([month_sin, month_cos, season_sin, season_cos])
+                future_calendar = torch.FloatTensor(fc_list).unsqueeze(0).to(self.device)
 
-        predictions = np.array(predictions)
+            predictions = []
+            with torch.no_grad():
+                current_input = input_tensor.clone()
+                for step in range(num_days):
+                    output = self.model(current_input)
+                    pred = output[:, -1, :]
+                    predictions.append(pred.cpu().numpy()[0])
+                    last_step = current_input[:, -1:, :].clone()
+                    if self._vmd_decomposer is None:
+                        last_step[:, :, :7] = pred.unsqueeze(1)
+                        last_step[:, :, 7:11] = future_calendar[:, step:step + 1, :]  # 4 个周期性编码特征
+                    else:  # 'aqi'
+                        K = self._vmd_decomposer.K
+                        last_step[:, :, K:K + 6] = pred.unsqueeze(1)[:, :, 1:7]
+                        last_step[:, :, -4:] = future_calendar[:, step:step + 1, :]  # 4 个周期性编码特征
+                    current_input = torch.cat([current_input[:, 1:, :], last_step], dim=1)
+            predictions = np.array(predictions)
         predictions = self.scaler.inverse_transform(predictions)
         for i in range(predictions.shape[0]):
             predictions[i] = validate_prediction(predictions[i])
@@ -252,16 +370,35 @@ class AirQualityPredictor:
         with torch.no_grad():
             for start in range(n_samples):
                 window = data[start:start + seq_len]
-                window_tensor = torch.FloatTensor(window).unsqueeze(0).to(self.device)
+                # 走纯数据转换：backtest 输入是缩放后 9 维，不做原始尺度 validate。
+                if self._vmd_decomposer is not None:
+                    window_tensor = self._build_model_tensor(window)
+                else:
+                    window_tensor = torch.FloatTensor(window).unsqueeze(0).to(self.device)
+
+                # 准备预测窗口对应的真实 calendar（周期性编码，4 个特征）：
+                # 旧实现 3 天预测共用窗口最后一帧的 calendar，导致模型被迫按
+                # calendar 预测、跨年时预测值突变（"阶梯线"现象）。
+                # 正确做法：每步用对应预测日的真实 calendar。
+                future_calendar = data[start + seq_len:start + seq_len + prediction_days, 7:11]
+                future_calendar = torch.FloatTensor(future_calendar).unsqueeze(0).to(self.device)
 
                 preds = []
                 cur = window_tensor.clone()
-                for _ in range(prediction_days):
+                for step in range(prediction_days):
                     out = self.model(cur)
                     p = out[:, -1, :]
                     preds.append(p.cpu().numpy()[0])
+                    # 自回归：根据 _vmd_target 决定如何替换 last_step
                     last_step = cur[:, -1:, :].clone()
-                    last_step[:, :, :7] = p.unsqueeze(1)
+                    if self._vmd_decomposer is None:
+                        last_step[:, :, :7] = p.unsqueeze(1)
+                        # 关键修复：用对应预测日的真实 calendar 替换，避免 calendar 信息泄露
+                        last_step[:, :, 7:11] = future_calendar[:, step:step + 1, :]  # 4 个周期性编码特征
+                    else:  # 'aqi'
+                        K = self._vmd_decomposer.K
+                        last_step[:, :, K:K + 6] = p.unsqueeze(1)[:, :, 1:7]
+                        last_step[:, :, -4:] = future_calendar[:, step:step + 1, :]  # 4 个周期性编码特征
                     cur = torch.cat([cur[:, 1:, :], last_step], dim=1)
 
                 preds = np.array(preds)

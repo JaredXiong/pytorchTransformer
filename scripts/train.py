@@ -96,14 +96,34 @@ def prepare_data():
 
 
 def save_artifacts(model, scaler) -> None:
-    """保存模型权重与标准化器"""
-    torch.save(
-        {
-            'model_state_dict': model.state_dict(),
-            'model_type': model.__class__.__name__,
-        },
-        config.file.model_save_path,
-    )
+    """保存模型权重与标准化器。
+
+    同时记录训练时的 input_size/output_size，使推理端能精确重建模型结构
+    （VMD 半监督训练会把 9 维特征扩展为 8+K 维，必须显式记录）。
+    VMD 模型额外保存 vmd_K 与 VMD 超参数，使推理端能重建 VMDDecomposer。
+    """
+    artifact = {
+        'model_state_dict': model.state_dict(),
+        'model_type': model.__class__.__name__,
+        'input_size': getattr(model, 'input_size', config.model.input_size),
+        'output_size': getattr(model, 'output_size', config.model.output_size),
+    }
+    # VMD 模型额外记录完整 VMDDecomposer 构造参数（含 K），供推理端重建。
+    vmd_K = getattr(model, 'vmd_K', None)
+    if vmd_K is not None:
+        artifact['vmd_params'] = {
+            'K': vmd_K,
+            'alpha': config.vmd.alpha,
+            'tau': config.vmd.tau,
+            'DC': config.vmd.DC,
+            'init': config.vmd.init,
+            'tol': config.vmd.tol,
+        }
+        # VMD target 决定推理时的特征变换路径：'aqi' 仅分解 AQI；
+        # 'all' 分解全部 7 个污染物。predictor 依赖此字段选择正确的 VMD 应用函数。
+        artifact['vmd_target'] = getattr(config.vmd, 'target', 'aqi')
+
+    torch.save(artifact, config.file.model_save_path)
     joblib.dump(scaler, config.file.scaler_path)
     logger.info(f"模型已保存到: {config.file.model_save_path}")
     logger.info(f"标准化器已保存到: {config.file.scaler_path}")
@@ -146,6 +166,74 @@ def run_prediction_example(raw_data, dates) -> None:
         future_dates=future_dates,
     )
     print(format_prediction_result(prediction_result, show_details=True))
+
+
+def run_backtest_evaluation(model, data, raw_data, dates, model_label: str) -> None:
+    """回测评估：滚动预测全量数据并生成 7 张污染物对比图。
+
+    这些图（保存到 ``outputs/figures/<model_label>/<feature>.png``）是衡量
+    模型实际预测效果的核心可视化——比训练历史曲线更有参考价值。
+
+    Args:
+        model: 训练好的模型（本函数内不再使用，重新从 checkpoint 加载以避免状态污染）
+        data: 缩放后 (N, 9) 数据（backtest 输入）
+        raw_data: 原始尺度 (N, 9) 数据（用于 y_true_raw）
+        dates: 日期 Series
+        model_label: 模型名（用于子文件夹命名）
+    """
+    from air_quality.inference import AirQualityPredictor
+    from air_quality.visualization import plot_backtest_results
+
+    logger.info("=" * 60)
+    logger.info("生成回测评估图（每个污染物一张）")
+    logger.info("=" * 60)
+
+    # 从 checkpoint 重新加载，避免与训练中 model 共享内存
+    predictor = AirQualityPredictor()
+    predictor.load_model()
+
+    seq_len = config.data.seq_length
+    pred_days = config.data.prediction_days
+    if len(data) < seq_len + pred_days + 1:
+        logger.warning(
+            f"数据长度({len(data)})不足以做回测，"
+            f"需要 ≥ {seq_len + pred_days + 1}（seq_len={seq_len}+pred_days={pred_days}+1）"
+        )
+        return
+
+    try:
+        result = predictor.backtest(data, dates, prediction_days=pred_days)
+    except Exception as e:
+        logger.warning(f"回测评估失败（跳过）: {e}")
+        return
+
+    # 构造 y_true_raw：用窗口对齐到原始尺度（与 processor 输出对齐）
+    y_true_raw = None
+    if raw_data is not None and len(raw_data) == len(data):
+        try:
+            n_samples = len(data) - seq_len - pred_days + 1
+            y_true_raw_list = []
+            for start in range(n_samples):
+                target_idx = slice(start + seq_len, start + seq_len + pred_days)
+                y_true_raw_list.append(raw_data[target_idx, :7])
+            y_true_raw = np.array(y_true_raw_list)
+        except Exception as e:
+            logger.warning(f"构造 y_true_raw 失败（继续）: {e}")
+
+    out_dir = plot_backtest_results(
+        y_true=result['y_true'],
+        y_pred=result['y_pred'],
+        dates=result['dates'],
+        model_type=model_label,
+        y_true_raw=y_true_raw,
+    )
+    logger.info(f"回测评估图已保存到目录: {out_dir}")
+    # 报告关键指标
+    metrics = result.get('metrics', {})
+    if metrics:
+        overall = {k: v for k, v in metrics.items() if k.startswith('overall_')}
+        if overall:
+            logger.info(f"  Overall: {overall}")
 
 
 def train_single_model(model_type: str, train_loader, test_loader, device) -> Dict[str, Any]:
@@ -382,7 +470,9 @@ def main() -> int:
             logger.info("运行半监督训练流程 (VMD-CNN-BiLSTM-Attention)")
             logger.info("=" * 60)
             from air_quality.data.vmd import VMDDecomposer
-            from air_quality.data.vmd_features import apply_vmd_to_aqi
+            from air_quality.data.vmd_features import (
+                apply_vmd_to_aqi, apply_vmd_to_features, POLLUTANT_ORDER,
+            )
             from air_quality.training import SemiSupervisedTrainer
 
             # 从 processor 拿完整序列（覆盖训练 + 测试区间）
@@ -393,7 +483,24 @@ def main() -> int:
                     tau=config.vmd.tau, DC=config.vmd.DC,
                     init=config.vmd.init, tol=config.vmd.tol,
                 )
-                full_X_vmd = apply_vmd_to_aqi(full_X, decomposer)
+                # 根据 config.vmd.target 选择 VMD 应用方式：
+                # - 'aqi' (默认)：只分解 AQI，向后兼容
+                # - 'all' (推荐)：分解全部 7 个污染物，
+                #   解决 O3 等反相关污染物缺少频率信息的均值回归问题
+                vmd_target = getattr(config.vmd, 'target', 'aqi')
+                if vmd_target == 'all':
+                    logger.info(
+                        "VMD target='all'：对全部 7 个污染物做 VMD，"
+                        f"K={config.vmd.K}，输入维度 = {7 * config.vmd.K + 2}"
+                    )
+                    full_X_vmd = apply_vmd_to_features(
+                        full_X, decomposer,
+                        target_features=list(POLLUTANT_ORDER),
+                        keep_raw=False,
+                    )
+                else:
+                    logger.info(f"VMD target='{vmd_target}'：仅分解 AQI（兼容模式）")
+                    full_X_vmd = apply_vmd_to_aqi(full_X, decomposer)
             else:
                 # 不启用 VMD 时直接使用原始 9 维特征
                 full_X_vmd = full_X
@@ -409,27 +516,50 @@ def main() -> int:
             )
             logger.info(f"半监督数据集: labeled={len(X_lab)}, unlabeled={len(X_unl)}, test={len(X_te)}")
 
+            # 反平滑 / 损失参数：与全监督 train_single_model 使用同一套配置，
+            # 这是修复"半监督预测过度平滑"的关键——此前 SemiSupervisedTrainer
+            # 硬编码 loss_type='huber'，完全绕过了反平滑损失与早停信号。
+            semi_loss_kwargs = {
+                'delta': config.training.delta,
+                'lambda_var': config.training.lambda_var,
+                'lambda_diff': config.training.lambda_diff,
+                'tau_var': config.training.tau_var,
+                'tau_diff': config.training.tau_diff,
+                'lambda_warmup_epochs': config.training.lambda_warmup_epochs,
+            }
+            # Teacher/Student 共用的训练超参
+            semi_common_kwargs = dict(
+                model_type='vmd_cnn_bilstm_attention',
+                input_size=full_X_vmd.shape[2],
+                device=str(device),
+                teacher_epochs=config.semi.teacher_epochs,
+                student_epochs=config.semi.student_epochs,
+                pseudo_confidence_threshold=config.semi.pseudo_confidence_threshold,
+                learning_rate=config.training.learning_rate,
+                weight_decay=config.training.weight_decay,
+                loss_type=config.training.loss_type,
+                loss_kwargs=semi_loss_kwargs,
+                detect_smoothing=config.training.detect_smoothing,
+                smoothing_threshold=config.training.smoothing_threshold,
+                smoothing_stop_patience=config.training.smoothing_stop_patience,
+                gradient_clip=config.training.gradient_clip,
+                early_stop_patience=config.semi.early_stop_patience,
+                vmd_K=config.vmd.K,  # 显式传 K，避免模型内部默认值与数据不一致
+            )
+
             if config.pretrain.enabled:
                 from air_quality.training import PretrainFinetuneTrainer
                 semi_trainer = PretrainFinetuneTrainer(
-                    model_type='vmd_cnn_bilstm_attention',
-                    input_size=full_X_vmd.shape[2],
-                    device=str(device),
-                    teacher_epochs=config.semi.teacher_epochs,
-                    student_epochs=config.semi.student_epochs,
-                    pseudo_confidence_threshold=config.semi.pseudo_confidence_threshold,
+                    **semi_common_kwargs,
                     pretrain_config=config.pretrain,
                 )
                 logger.info("启用预训练-微调范式(Phase 0: 掩码自监督预训练)")
             else:
-                semi_trainer = SemiSupervisedTrainer(
-                    model_type='vmd_cnn_bilstm_attention',
-                    input_size=full_X_vmd.shape[2],
-                    device=str(device),
-                    teacher_epochs=config.semi.teacher_epochs,
-                    student_epochs=config.semi.student_epochs,
-                    pseudo_confidence_threshold=config.semi.pseudo_confidence_threshold,
-                )
+                semi_trainer = SemiSupervisedTrainer(**semi_common_kwargs)
+            logger.info(
+                f"半监督损失配置: loss_type={config.training.loss_type}, "
+                f"detect_smoothing={config.training.detect_smoothing}"
+            )
             model, semi_metrics = semi_trainer.fit(
                 X_labeled=X_lab, y_labeled=y_lab,
                 X_unlabeled=X_unl, y_unlabeled=y_unl,
@@ -444,10 +574,23 @@ def main() -> int:
         log_training_summary(history)
         run_prediction_example(raw_data, dates)
 
+        # 根据实际训练模式选择图表命名：半监督训练实际跑的是
+        # vmd_cnn_bilstm_attention，不能用 argparse 默认的 args.model='hybrid'。
+        model_label = (
+            'vmd_cnn_bilstm_attention' if config.semi.enabled else args.model
+        )
+        if config.pretrain.enabled:
+            model_label = f'{model_label}_pretrain'
         timestamp = time.strftime('%Y%m%d_%H%M%S')
-        plot_path = os.path.join(config.file.figures_dir, f'training_history_{args.model}_{timestamp}.png')
+        plot_path = os.path.join(
+            config.file.figures_dir, f'training_history_{model_label}_{timestamp}.png',
+        )
         plot_training_history(history, save_path=plot_path)
         logger.info(f"训练历史图表已保存到: {plot_path}")
+
+        # === 回测评估：生成 7 张污染物真值 vs 预测对比图 ===
+        # 这是衡量模型实际预测效果的核心图，比训练历史曲线更有参考价值。
+        run_backtest_evaluation(model, data, raw_data, dates, model_label)
 
         logger.info("空气质量预测系统执行完成")
         return 0

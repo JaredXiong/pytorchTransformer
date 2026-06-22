@@ -10,8 +10,8 @@ from air_quality.config import config
 
 class TestCalendarConfig(unittest.TestCase):
     def test_input_size_unchanged(self):
-        """Input still includes month/season = 9 features."""
-        self.assertEqual(config.model.input_size, 9)
+        """Input includes 7 pollutants + 4 cyclic calendar features = 11 features."""
+        self.assertEqual(config.model.input_size, 11)
 
     def test_output_size_added(self):
         """Output is 7 pollutants only."""

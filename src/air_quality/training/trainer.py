@@ -236,11 +236,16 @@ class ModelTrainer:
         return total_loss / batch_count, payload
 
     def _save_model(self) -> None:
-        """保存模型"""
+        """保存模型
+
+        同步记录 input_size/output_size，使推理端能精确重建模型结构。
+        """
         if self.best_model_path:
             torch.save({
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'best_loss': self.best_loss,
                 'model_type': self.model.__class__.__name__,
+                'input_size': getattr(self.model, 'input_size', None),
+                'output_size': getattr(self.model, 'output_size', None),
             }, self.best_model_path)

@@ -40,13 +40,13 @@ class TestProcessorSplit(unittest.TestCase):
             data, scaler, features, dates = self.processor.load_and_preprocess_data(path)
             # scaler fitted on 7 pollutants
             self.assertEqual(scaler.n_features_in_, 7)
-            # full data array is 9-dim
-            self.assertEqual(data.shape[1], 9)
+            # full data array is 11-dim (7 pollutants + 4 cyclic calendar features)
+            self.assertEqual(data.shape[1], 11)
         finally:
             os.unlink(path)
 
     def test_create_sequences_split_shapes(self):
-        """X has 9 features (last 2 are month/season), y has 7 features (pollutants only)."""
+        """X has 11 features (7 pollutants + 4 cyclic calendar), y has 7 features (pollutants only)."""
         n = 60
         df = pd.DataFrame({
             'pubtime': pd.date_range('2024-01-01', periods=n, freq='D'),
@@ -65,8 +65,8 @@ class TestProcessorSplit(unittest.TestCase):
         try:
             data, scaler, features, dates = self.processor.load_and_preprocess_data(path)
             X, y = self.processor.create_sequences(data)
-            # X contains month/season
-            self.assertEqual(X.shape[-1], 9)
+            # X contains 7 pollutants + 4 cyclic calendar features
+            self.assertEqual(X.shape[-1], 11)
             # y contains pollutants only
             self.assertEqual(y.shape[-1], 7)
         finally:

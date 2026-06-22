@@ -64,9 +64,14 @@ class AirQualityDataProcessor:
         dates = df[date_col].copy()
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
 
-        # 提取时间特征
+        # 提取时间特征（周期性编码，避免跨年时 month 12→1 的突变）
         df['month'] = df[date_col].dt.month
         df['season'] = (df[date_col].dt.month % 12 + 3) // 3
+        # 周期性编码：month 和 season 各用 sin/cos 表示，共 4 个特征
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+        df['season_sin'] = np.sin(2 * np.pi * df['season'] / 4)
+        df['season_cos'] = np.cos(2 * np.pi * df['season'] / 4)
 
         # 列名映射
         column_mapping = self._create_column_mapping(df.columns)
@@ -113,15 +118,20 @@ class AirQualityDataProcessor:
             self.scaler.fit(scaler_fit_data)
         scaled_pollutants = self.scaler.transform(poll_data)
 
-        # 拼接日历特征（month/season 原始整数，不缩放）
-        calendar = df[['month', 'season']].values
+        # 拼接日历特征（周期性编码：month_sin/cos + season_sin/cos，共 4 列）
+        calendar = df[['month_sin', 'month_cos', 'season_sin', 'season_cos']].values
         data = np.hstack([scaled_pollutants, calendar])
 
-        # 记录 scaler 的特征名（用 pollutant_features，未含滚动列名以保持向后兼容）
-        self.scaler.feature_names_in_ = list(poll_df.columns) + [
-            f'rolling_{w}' for w in self.rolling_windows
-            for _ in range(len(pollutant_features) * 2)
-        ]
+        # 记录 scaler 的特征名（用 pollutant_features，未含滚动列名以保持向后兼容）。
+        # 必须用 dtype=object：否则 np.array 默认 dtype='<U...' 会把 str 元素
+        # 转成 numpy.str_，sklearn.transform 严格匹配列名 dtype，会发 UserWarning。
+        self.scaler.feature_names_in_ = np.array(
+            [str(c) for c in list(poll_df.columns)] + [
+                f'rolling_{w}' for w in self.rolling_windows
+                for _ in range(len(pollutant_features) * 2)
+            ],
+            dtype=object,
+        )
 
         self.stats = DataStats(
             original_shape=original_shape,
@@ -184,7 +194,7 @@ class AirQualityDataProcessor:
     def create_sequences(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """构造输入输出序列。
 
-        X 形状 (N_samples, seq_length, 9)：包含 month/season 在最后两列。
+        X 形状 (N_samples, seq_length, 11)：包含 7 污染物 + 4 周期性日历特征。
         y 形状 (N_samples, prediction_days, 7)：仅污染物（前 7 列）。
         """
         min_required_length = self.seq_length + self.prediction_days

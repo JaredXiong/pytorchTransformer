@@ -9,6 +9,11 @@ from .processor import (
     split_data,
     calculate_metrics,
 )
+from .vmd_features import (
+    apply_vmd_to_aqi,
+    apply_vmd_to_features,
+    POLLUTANT_ORDER,
+)
 
 __all__ = [
     'AirQualityDataProcessor',
@@ -17,4 +22,7 @@ __all__ = [
     'validate_prediction',
     'split_data',
     'calculate_metrics',
+    'apply_vmd_to_aqi',
+    'apply_vmd_to_features',
+    'POLLUTANT_ORDER',
 ]
